@@ -1,0 +1,17 @@
+# MedVision AI — FastAPI inference engine
+# Install with: pip install -r backend/requirements.txt
+# torch/torchvision are optional: the engine degrades gracefully to demo mode without them.
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+Pillow>=10.2
+numpy>=1.26
+
+# Real inference (optional but recommended)
+torch>=2.1
+torchvision>=0.16
+
+# Explainability (optional)
+captum>=0.7
+opencv-python>=4.9

@@ -1,0 +1,6 @@
+{
+  "name": "MedVision AI",
+  "description": "Explainable Medical Image Report Generator with Multi-Disease Detection, Grad-CAM Heatmaps, and AI Radiology Report Generation",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
