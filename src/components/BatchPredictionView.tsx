@@ -6,6 +6,7 @@ export const BatchPredictionView: React.FC = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [batchResults, setBatchResults] = useState<any[]>([]);
+  const [batchError, setBatchError] = useState<string | null>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -13,6 +14,7 @@ export const BatchPredictionView: React.FC = () => {
       setBatchFiles(filesArr);
       setBatchResults([]);
       setProgress(0);
+      setBatchError(null);
     }
   };
 
@@ -54,14 +56,23 @@ export const BatchPredictionView: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           files: batchFiles.map((f) => ({ name: f.name, size: f.size })),
+          // This UI is explicitly labeled DEMO MODE — the server honors that
+          // opt-in and returns clearly-flagged simulated profiles, never
+          // silently substituting demo for real inference.
+          mode: 'demo',
         }),
       });
       const data = await res.json();
       if (data.batchResults) {
         setBatchResults(data.batchResults);
+      } else if (data?.message) {
+        setBatchError(data.message);
+      } else {
+        setBatchError('Batch processing failed. No predictions were generated.');
       }
     } catch (err) {
       console.error('Batch error:', err);
+      setBatchError('AI inference is temporarily unavailable. No batch predictions were generated.');
     } finally {
       setIsProcessing(false);
     }
@@ -79,6 +90,9 @@ export const BatchPredictionView: React.FC = () => {
           <p className="text-xs text-slate-500 mt-0.5">
             Process cohort studies and bulk chest radiograph archives with parallel multi-GPU worker queues.
           </p>
+          <span className="mt-1.5 inline-flex items-center gap-1 text-[10px] font-mono font-bold text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-full px-2 py-0.5">
+            <AlertCircle className="w-3 h-3" /> DEMO MODE — batch results are simulated profiles, not live inference
+          </span>
         </div>
 
         {batchResults.length > 0 && (
@@ -121,6 +135,16 @@ export const BatchPredictionView: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Engine-unavailable error (no fabricated batch results) */}
+      {batchError && (
+        <div className="flex items-start gap-2.5 bg-rose-500/10 border border-rose-500/30 rounded-lg p-3.5 text-[11px] text-rose-700 dark:text-rose-300 animate-fade-in">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <p className="leading-relaxed">
+            <strong>No batch predictions generated.</strong> {batchError}
+          </p>
+        </div>
+      )}
 
       {/* Run Action Bar */}
       {batchFiles.length > 0 && (

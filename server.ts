@@ -1,9 +1,10 @@
 import express from 'express';
 import path from 'path';
-import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
-import dotenv from 'dotenv';
+import { APP_NAME, APP_VERSION, config, validateConfig } from './config';
+import { log, requestLogger, securityHeaders, setLogLevel } from './logger';
+import { AuditEntry, initStorage, persistAudit, persistHistory, storageBackend } from './storage';
 import {
   DASHBOARD_STATS,
   DATASETS,
@@ -13,14 +14,20 @@ import {
   TRAINING_RUNS,
   getPatientDetail,
 } from './src/data/mockEnterprise';
-
-dotenv.config();
+import { SAMPLE_XRAYS } from './src/data/sampleXrays';
 
 const app = express();
-const PORT = 3000;
+const PORT = config.port;
+
+// Only when TRUST_PROXY is explicitly set (Render/nginx/LB deployments) so
+// rate limiting and audit IPs reflect the real client instead of the proxy.
+app.set('trust proxy', config.trustProxy as boolean | number);
+
+// Structured logging level from environment (LOG_LEVEL)
+setLogLevel(config.logLevel);
 
 // Initialize Gemini Client server-side
-const aiKey = process.env.GEMINI_API_KEY;
+const aiKey = config.geminiApiKey;
 let ai: GoogleGenAI | null = null;
 if (aiKey) {
   try {
@@ -33,14 +40,86 @@ if (aiKey) {
       },
     });
   } catch (err) {
-    console.error('Failed to initialize GoogleGenAI client:', err);
+    log.error('gemini-init-failed', { error: (err as Error).message });
   }
 }
 
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: config.uploadMaxBytes }));
+app.use(requestLogger());
+app.use(securityHeaders());
+
+// CORS whitelist — active only when ALLOWED_ORIGINS is configured. The SPA is
+// served same-origin so it needs no CORS headers; this supports cross-origin
+// deployments without weakening same-origin behavior.
+if (config.allowedOrigins.length > 0) {
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && config.allowedOrigins.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-request-id');
+    }
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Live system monitoring counters (consumed by GET /api/monitoring)
+// ---------------------------------------------------------------------------
+const monitor = {
+  startedAt: Date.now(),
+  requests: 0,
+  errors: 0,
+  rejectedImages: 0,
+  predictions: 0,
+  rateLimited: 0,
+  inferenceWindow: [] as number[],
+  requestWindow: [] as number[],
+};
+
+app.use((req, res, next) => {
+  monitor.requests += 1;
+  monitor.requestWindow.push(Date.now());
+  res.on('finish', () => {
+    if (res.statusCode >= 500) monitor.errors += 1;
+  });
+  next();
+});
+
+// Anonymous audit trail for security-relevant endpoints. Registered BEFORE the
+// guarded routes so every predict/validate/batch/history request is captured.
+// MedVision AI has no accounts, so every entry is attributed to an anonymous
+// public actor — no invented users. Handlers attach validation/engine/report
+// state via auditDetail() (read from res.locals on 'finish').
+const AUDIT_PATHS = /^\/(api\/(predict|validate|batch-predict|history))(\/|\?|$)/;
+app.use((req, res, next) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  res.on('finish', () => {
+    if (AUDIT_PATHS.test(req.path)) {
+      const entry: AuditEntry = {
+        id: `aud_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        time: new Date().toISOString(),
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        ip,
+        actor: 'anonymous',
+        detail: res.locals.audit ? JSON.stringify(res.locals.audit) : undefined,
+      };
+      auditStore.unshift(entry);
+      auditStore.splice(500);
+      persistAudit(entry);
+    }
+  });
+  next();
+});
 
 // In-memory database storage for history and analytics
 const historyStore: any[] = [];
+const auditStore: AuditEntry[] = [];
 const statsStore = {
   totalPredictions: 4,
   avgInferenceMs: 145,
@@ -66,7 +145,7 @@ const statsStore = {
 // ---------------------------------------------------------------------------
 // PyTorch inference engine bridge (FastAPI on :8000) — probed with a short TTL
 // ---------------------------------------------------------------------------
-const ENGINE_BASE = process.env.PYTORCH_ENGINE_URL || 'http://127.0.0.1:8000';
+const ENGINE_BASE = config.engineBase;
 const ENGINE_CACHE_TTL = 30_000;
 
 interface EngineInfo {
@@ -96,41 +175,113 @@ async function probeEngine(): Promise<EngineInfo> {
 }
 
 // ---------------------------------------------------------------------------
-// JWT-style auth (HMAC via node crypto — zero new dependencies)
+// Public-API rate limiter (per IP, sliding 60s window) — abuse protection.
+// MedVision AI is a public research platform with no accounts, so per-IP
+// throttling of expensive endpoints replaces login throttling.
 // ---------------------------------------------------------------------------
-const JWT_SECRET = process.env.JWT_SECRET || 'medvision-dev-secret-change-me';
+const apiCalls = new Map<string, { count: number; resetAt: number }>();
+const PUBLIC_API_LIMIT = config.apiRateLimit;
 
-const MOCK_USERS = [
-  { id: 'u_admin', name: 'Alex Morgan', email: 'admin@medvision.ai', password: 'admin123', role: 'Admin' },
-  { id: 'u_rad', name: 'Dr. Ayesha Vance', email: 'radiologist@medvision.ai', password: 'rad123', role: 'Radiologist' },
-  { id: 'u_doc', name: 'Dr. Liam Carter', email: 'doctor@medvision.ai', password: 'doc123', role: 'Doctor' },
-  { id: 'u_res', name: 'Dr. Priya Nair', email: 'researcher@medvision.ai', password: 'res123', role: 'Researcher' },
-  { id: 'u_stu', name: 'Jordan Lee', email: 'student@medvision.ai', password: 'stu123', role: 'Student' },
-];
-
-function signToken(payload: Record<string, unknown>): string {
-  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const body = Buffer.from(
-    JSON.stringify({ ...payload, iat: Date.now(), exp: Date.now() + 8 * 3600 * 1000 })
-  ).toString('base64url');
-  const sig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
-  return `${header}.${body}.${sig}`;
+function apiRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const entry = apiCalls.get(ip);
+  if (!entry || now > entry.resetAt) {
+    apiCalls.set(ip, { count: 1, resetAt: now + 60_000 });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > PUBLIC_API_LIMIT;
 }
 
-function verifyToken(token: string): Record<string, unknown> | null {
-  try {
-    const [h, b, s] = token.split('.');
-    if (!h || !b || !s) return null;
-    const expected = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url');
-    // Constant-time signature comparison (length-guarded) to avoid timing side channels
-    if (s.length !== expected.length) return null;
-    if (!crypto.timingSafeEqual(Buffer.from(s), Buffer.from(expected))) return null;
-    const payload = JSON.parse(Buffer.from(b, 'base64url').toString('utf8')) as Record<string, unknown>;
-    if (typeof payload.exp === 'number' && payload.exp < Date.now()) return null;
-    return payload;
-  } catch {
-    return null;
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, e] of apiCalls) if (now > e.resetAt) apiCalls.delete(ip);
+}, 60_000).unref?.();
+
+// Expensive public endpoints — HTTP 429 when a client exhausts its per-IP budget
+const EXPENSIVE_PATHS = /^\/(api\/(predict|validate|chat|batch-predict))(\/|\?|$)/;
+app.use((req, res, next) => {
+  if (EXPENSIVE_PATHS.test(req.path)) {
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    if (apiRateLimited(ip)) {
+      monitor.rateLimited += 1;
+      return res.status(429).json({ error: 'Rate limit exceeded. Please retry shortly.' });
+    }
   }
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// Server-side trust-boundary helpers.
+//   SAMPLE_STUDY_NAMES — the bundled demo studies. A request is treated as the
+//   SAMPLE workflow ONLY when its imageName matches one of these server-side
+//   constants; the client can never tag arbitrary content as a sample.
+//   validateViaEngine — the authoritative FastAPI safety gate (type classifier
+//   + OOD + quality). Runs for every user upload before any inference.
+// ---------------------------------------------------------------------------
+const SAMPLE_STUDY_NAMES = new Set([
+  'chest_xray_pneumonia_rll.dcm',
+  'chest_xray_covid_bilateral.dcm',
+  'chest_xray_cardiomegaly_pa.dcm',
+  'chest_xray_normal_screening.dcm',
+]);
+// Byte-exact data URLs of the bundled demo studies — a request that names a
+// sample study AND supplies image bytes must match these to be treated as the
+// SAMPLE workflow. A spoofed filename with arbitrary bytes falls back to the
+// user-upload path (which requires the authoritative engine).
+const SAMPLE_SVG_DATA_URLS = new Set(SAMPLE_XRAYS.map((s) => s.svgDataUrl));
+
+function isKnownSample(imageName?: string, imageData?: string): boolean {
+  if (typeof imageName !== 'string' || !SAMPLE_STUDY_NAMES.has(imageName)) return false;
+  if (typeof imageData !== 'string' || imageData === '') return true; // name-only demo path
+  return SAMPLE_SVG_DATA_URLS.has(imageData); // byte-verified when bytes are present
+}
+
+async function validateViaEngine(
+  imageName: string | undefined,
+  imageData: string
+): Promise<
+  | { reason: 'passed'; validation: any }
+  | { reason: 'gate-failed'; validation: any }
+  | { reason: 'unavailable' }
+> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const upstream = await fetch(`${ENGINE_BASE}/api/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageName, imageData }),
+      signal: controller.signal,
+    });
+    if (!upstream.ok) return { reason: 'unavailable' };
+    const validation = await upstream.json();
+    return validation.passed === true
+      ? { reason: 'passed', validation }
+      : { reason: 'gate-failed', validation };
+  } catch {
+    return { reason: 'unavailable' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function recordPrediction(result: any) {
+  historyStore.unshift(result);
+  if (historyStore.length > 200) historyStore.length = 200;
+  persistHistory(historyStore);
+  monitor.predictions += 1;
+  monitor.inferenceWindow.push(result.inferenceTimeMs || 0);
+  monitor.inferenceWindow = monitor.inferenceWindow.slice(-200);
+  statsStore.totalPredictions += 1;
+  statsStore.severityDistribution[result.severity] = (statsStore.severityDistribution[result.severity] || 0) + 1;
+  statsStore.topDiseasesCount[result.topDiagnosis] = (statsStore.topDiseasesCount[result.topDiagnosis] || 0) + 1;
+}
+
+// Attach audit context for the anonymous audit log (consumed by the middleware
+// on 'finish'). Documents validation/engine/report state per request.
+function auditDetail(res: express.Response, action: string, state: string, outcome: string) {
+  res.locals.audit = { action, state, outcome };
 }
 
 // GET /api/engine — current inference engine status (for the UI badge)
@@ -147,6 +298,92 @@ app.get('/api/health', (req, res) => {
     geminiConfigured: !!ai,
     timestamp: new Date().toISOString(),
   });
+});
+
+// GET /api/version — application + engine version info
+app.get('/api/version', async (_req, res) => {
+  const engine = await probeEngine();
+  res.json({
+    name: APP_NAME,
+    version: APP_VERSION,
+    node: process.version,
+    engine: { status: engine.status, source: engine.source, device: engine.device },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// GET /api/ready — orchestration health check (200 when serving, 503 when a
+// configured dependency is down).
+app.get('/api/ready', async (_req, res) => {
+  const engine = await probeEngine();
+  const checks: Record<string, { status: string; detail?: string }> = {
+    server: { status: 'up' },
+    engine: { status: engine.status === 'ready' ? 'up' : 'degraded', detail: `${engine.source} / ${engine.device}` },
+    storage: { status: storageBackend() === 'memory' ? 'degraded' : 'up', detail: storageBackend() },
+  };
+  if (config.databaseUrl) {
+    // 'degraded' (still 200) when the Postgres adapter is unavailable so the
+    // container healthcheck never flaps on the optional dependency; 'down'
+    // is reserved for genuinely failing core dependencies.
+    const backend = storageBackend();
+    checks.database = backend === 'postgres'
+      ? { status: 'up', detail: 'postgres' }
+      : { status: 'degraded', detail: 'DATABASE_URL configured but Postgres adapter unavailable — durable JSON fallback in use' };
+  }
+  const ready = Object.values(checks).every((c) => c.status !== 'down');
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not-ready',
+    checks,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// GET /api/metrics — Prometheus-style operational metrics (text format)
+app.get('/api/metrics', async (_req, res) => {
+  const engine = await probeEngine();
+  const mem = process.memoryUsage();
+  const cpu = process.cpuUsage();
+  const now = Date.now();
+  const uptimeSec = Math.round((now - monitor.startedAt) / 1000);
+  const cpuMsTotal = (cpu.user + cpu.system) / 1000;
+  const cpuPercent = uptimeSec > 0 ? Math.min(100, Math.round((cpuMsTotal / 1000 / uptimeSec) * 100)) : 0;
+  const lines = [
+    '# HELP medvision_requests_total Total HTTP requests served',
+    '# TYPE medvision_requests_total counter',
+    `medvision_requests_total ${monitor.requests}`,
+    '# HELP medvision_errors_total HTTP 5xx responses',
+    '# TYPE medvision_errors_total counter',
+    `medvision_errors_total ${monitor.errors}`,
+    '# HELP medvision_predictions_total Completed inference predictions',
+    '# TYPE medvision_predictions_total counter',
+    `medvision_predictions_total ${monitor.predictions}`,
+    '# HELP medvision_rejected_images_total Images rejected by the safety gate',
+    '# TYPE medvision_rejected_images_total counter',
+    `medvision_rejected_images_total ${monitor.rejectedImages}`,
+    '# HELP medvision_rate_limited_total Requests rejected by the public API rate limiter',
+    '# TYPE medvision_rate_limited_total counter',
+    `medvision_rate_limited_total ${monitor.rateLimited}`,
+    '# HELP medvision_requests_per_minute Request rate (60s window)',
+    '# TYPE medvision_requests_per_minute gauge',
+    `medvision_requests_per_minute ${monitor.requestWindow.length}`,
+    '# HELP medvision_uptime_seconds Process uptime',
+    '# TYPE medvision_uptime_seconds gauge',
+    `medvision_uptime_seconds ${uptimeSec}`,
+    '# HELP medvision_memory_rss_bytes Resident set size',
+    '# TYPE medvision_memory_rss_bytes gauge',
+    `medvision_memory_rss_bytes ${mem.rss}`,
+    '# HELP medvision_memory_heap_used_bytes V8 heap used',
+    '# TYPE medvision_memory_heap_used_bytes gauge',
+    `medvision_memory_heap_used_bytes ${mem.heapUsed}`,
+    '# HELP medvision_cpu_percent CPU percent of one core over uptime',
+    '# TYPE medvision_cpu_percent gauge',
+    `medvision_cpu_percent ${cpuPercent}`,
+    '# HELP medvision_engine_status Engine readiness (1=ready, 0=offline)',
+    '# TYPE medvision_engine_status gauge',
+    `medvision_engine_status ${engine.status === 'ready' ? 1 : 0}`,
+  ];
+  res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+  res.send(lines.join('\n') + '\n');
 });
 
 // GET Models Endpoint
@@ -178,23 +415,219 @@ app.delete('/api/history/:id', (req, res) => {
   const index = historyStore.findIndex(item => item.id === id);
   if (index !== -1) {
     historyStore.splice(index, 1);
+    persistHistory(historyStore);
     return res.json({ success: true, message: 'Deleted successfully' });
   }
   res.status(404).json({ success: false, error: 'Item not found' });
 });
 
-// POST /api/predict Endpoint
+// POST /api/validate — AI Safety Gate (type classifier + OOD + quality)
+app.post('/api/validate', async (req, res) => {
+  try {
+    const { imageData, imageName, clientValidation } = req.body || {};
+    if (typeof imageData === 'string' && imageData.length > config.uploadMaxBytes) {
+      return res.status(413).json({ error: `Image payload exceeds ${Math.round(config.uploadMaxBytes / 1048576)}MB limit` });
+    }
+
+    // Prefer the real PyTorch engine's safety gate when it is online
+    const engine = await probeEngine();
+    if (engine.status === 'ready' && imageData) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10_000);
+      try {
+        const upstream = await fetch(`${ENGINE_BASE}/api/validate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ imageName, imageData }),
+          signal: controller.signal,
+        });
+        if (upstream.ok) {
+          const body = await upstream.json();
+          body.source = 'pytorch-engine';
+          body.proxied = true;
+          return res.json(body);
+        }
+        throw new Error(`engine validate http ${upstream.status}`);
+      } catch (upstreamErr) {
+        log.warn('engine-validate-fallback', { error: (upstreamErr as Error).message });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    // Honest offline fallback built from the client-side analyzer report
+    const passed = clientValidation?.passed !== false;
+    res.json({
+      passed,
+      source: 'client-heuristic',
+      proxied: false,
+      type: passed
+        ? { predicted: 'chest_xray', confidences: { chest_xray: 0.94, other_xray: 0.03, unknown: 0.03 }, method: 'client-heuristic' }
+        : { predicted: 'unknown', confidences: {}, method: 'client-heuristic' },
+      quality: { score: clientValidation?.score ?? 0, threshold: config.qualityThreshold },
+      ood: null,
+      calibration: { temperature: 1.0 },
+      note: 'PyTorch engine offline — safety-gate summary supplied by the client-side analyzer.',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Validation failed' });
+  }
+});
+
+// GET /api/monitoring — live operational telemetry
+app.get('/api/monitoring', async (_req, res) => {
+  const engine = await probeEngine();
+  const mem = process.memoryUsage();
+  const cpu = process.cpuUsage();
+  const now = Date.now();
+  const uptimeSec = Math.round((now - monitor.startedAt) / 1000);
+  monitor.requestWindow = monitor.requestWindow.filter((t) => now - t < 60_000);
+  const avgInferenceMs = monitor.inferenceWindow.length
+    ? Math.round(monitor.inferenceWindow.reduce((a, b) => a + b, 0) / monitor.inferenceWindow.length)
+    : null;
+  // process.cpuUsage() returns accumulated CPU time in microseconds; express it
+  // as a live percentage of one core over the process uptime.
+  const cpuMsTotal = (cpu.user + cpu.system) / 1000;
+  const cpuPercent = uptimeSec > 0 ? Math.min(100, Math.round((cpuMsTotal / 1000 / uptimeSec) * 100)) : 0;
+  res.json({
+    service: 'MedVision AI Server',
+    version: APP_VERSION,
+    status: 'healthy',
+    uptimeSec,
+    requests: monitor.requests,
+    requestsPerMinute: monitor.requestWindow.length,
+    errors: monitor.errors,
+    rejectedImages: monitor.rejectedImages,
+    predictions: monitor.predictions,
+    avgInferenceMs,
+    engine: { status: engine.status, source: engine.source, device: engine.device },
+    modelVersion: APP_VERSION,
+    storage: storageBackend(),
+    memory: {
+      rssMb: Math.round(mem.rss / 1048576),
+      heapUsedMb: Math.round(mem.heapUsed / 1048576),
+      heapTotalMb: Math.round(mem.heapTotal / 1048576),
+    },
+    cpu: { user: cpuPercent, system: 0 },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// POST /api/predict — authoritative server-side gated inference.
+//
+// TRUST BOUNDARY:
+//   - The client is NEVER trusted. Client-supplied validation, quality, OOD,
+//     image-type, confidence, and uncertainty fields are advisory at most;
+//     NONE of them can authorize inference.
+//   - A client-claimed FAILURE may short-circuit (rejecting is always safe).
+//   - Inference runs ONLY when the server has independently established:
+//       1. a decodable image payload is present (user uploads),
+//       2. the FastAPI ML engine is reachable,
+//       3. the FastAPI safety gate (type + OOD + quality) PASSED.
+//   - The ONLY exception is the explicit SAMPLE workflow: a request whose
+//     imageName matches one of the bundled demo studies (server-verified)
+//     produces a clearly-labelled demo profile (engineMode: 'demo-engine').
+//     Demo inference is NEVER silently substituted for failed real inference.
 app.post('/api/predict', async (req, res) => {
   try {
-    const { imageName, imageData, model = 'DenseNet121', clahe = false, noiseRemoval = false } = req.body;
+    const { imageName, imageData, model = 'DenseNet121', clahe = false, noiseRemoval = false, validation } = req.body;
 
     if (!imageData && !imageName) {
       return res.status(400).json({ error: 'Image data or image name is required' });
     }
 
-    // Try the real PyTorch engine first (FastAPI :8000). Silent fallback to simulation.
-    const engine = await probeEngine();
-    if (engine.status === 'ready') {
+    // Input cap: refuse oversized payloads before any processing
+    if (typeof imageData === 'string' && imageData.length > config.uploadMaxBytes) {
+      return res.status(413).json({ error: `Image payload exceeds ${Math.round(config.uploadMaxBytes / 1048576)}MB limit` });
+    }
+
+    // Server-side MIME check: reject data-URLs that are not raster/SVG images
+    if (
+      imageData &&
+      typeof imageData === 'string' &&
+      imageData.startsWith('data:') &&
+      !/^data:image\/(?:png|jpe?g|webp|gif|bmp|svg\+xml)(?:;|,)/i.test(imageData)
+    ) {
+      monitor.rejectedImages += 1;
+      auditDetail(res, 'predict', 'non-image-payload', 'rejected');
+      return res.status(422).json({
+        error: 'Unsupported image format. Upload a PNG, JPEG, WebP, or DICOM chest X-ray.',
+        code: 'UNSUPPORTED_IMAGE',
+        predictionGenerated: false,
+        reportAllowed: false,
+      });
+    }
+
+    // Client validation is ADVISORY ONLY: a client-claimed FAILURE short-circuits
+    // (rejecting is always safe), but a client-claimed PASS never authorizes
+    // inference — the server performs its own authoritative validation below.
+    if (validation && typeof validation.passed === 'boolean' && !validation.passed) {
+      monitor.rejectedImages += 1;
+      auditDetail(res, 'predict', 'client-claimed-failure', 'rejected');
+      return res.status(422).json({
+        error: 'Image failed chest X-ray validation. Only valid frontal chest X-rays can be analyzed.',
+        code: 'VALIDATION_FAILED',
+        predictionGenerated: false,
+        reportAllowed: false,
+      });
+    }
+
+    // SAMPLE workflow — server-verified against the bundled demo studies.
+    if (isKnownSample(imageName, imageData)) {
+      // Falls through to the deterministic demo body below (clearly labelled).
+    } else {
+      // USER UPLOAD — authoritative gating from here on.
+      if (typeof imageData !== 'string' || imageData === '') {
+        auditDetail(res, 'predict', 'no-image-bytes', 'rejected');
+        return res.status(422).json({
+          error: 'INVALID_IMAGE: no image bytes were supplied for server-side validation.',
+          code: 'INVALID_IMAGE',
+          predictionGenerated: false,
+          reportAllowed: false,
+        });
+      }
+
+      const engine = await probeEngine();
+      if (engine.status !== 'ready') {
+        auditDetail(res, 'predict', 'engine-offline', 'blocked');
+        return res.status(503).json({
+          ok: false,
+          status: 'engine_unavailable',
+          code: 'ML_ENGINE_UNAVAILABLE',
+          message: 'The medical inference engine is currently unavailable. No prediction was generated.',
+          predictionGenerated: false,
+          reportAllowed: false,
+          engine: { status: 'offline', source: 'demo', engineMode: 'demo-engine', device: 'cpu' },
+        });
+      }
+
+      // Server-side authoritative validation via the FastAPI safety gate.
+      const v = await validateViaEngine(imageName, imageData);
+      if (v.reason === 'unavailable') {
+        auditDetail(res, 'predict', 'validation-unavailable', 'blocked');
+        return res.status(503).json({
+          ok: false,
+          status: 'validation_unavailable',
+          code: 'VALIDATION_UNAVAILABLE',
+          message: 'Server-side image validation is temporarily unavailable. No prediction was generated.',
+          predictionGenerated: false,
+          reportAllowed: false,
+        });
+      }
+      if (v.reason === 'gate-failed') {
+        monitor.rejectedImages += 1;
+        auditDetail(res, 'predict', 'server-validation-failed', 'rejected');
+        return res.status(422).json({
+          error: 'Image failed server-side validation. Only valid frontal chest X-rays can be analyzed.',
+          code: 'VALIDATION_FAILED',
+          validation: v.validation,
+          validationSource: 'fastapi',
+          predictionGenerated: false,
+          reportAllowed: false,
+        });
+      }
+
+      // Authoritative validation PASSED — real inference through the engine.
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 12_000);
       try {
@@ -204,28 +637,49 @@ app.post('/api/predict', async (req, res) => {
           body: JSON.stringify({ imageName, imageData, model, clahe, noiseRemoval }),
           signal: controller.signal,
         });
-        if (upstream.ok) {
-          const result = await upstream.json();
-          result.engine = { ...(result.engine || {}), proxied: true, via: ENGINE_BASE };
-          // Patch image echo fields the frontend requires (upstream schema omits them)
-          result.originalImageUrl = imageData || result.originalImageUrl;
-          result.heatmapOverlayUrl = imageData || result.heatmapOverlayUrl;
-          result.claheApplied = !!clahe;
-          result.noiseRemovalApplied = !!noiseRemoval;
-          historyStore.unshift(result);
-          statsStore.totalPredictions += 1;
-          statsStore.severityDistribution[result.severity] = (statsStore.severityDistribution[result.severity] || 0) + 1;
-          statsStore.topDiseasesCount[result.topDiagnosis] = (statsStore.topDiseasesCount[result.topDiagnosis] || 0) + 1;
-          return res.json(result);
-        }
-        throw new Error(`engine predict http ${upstream.status}`);
+        if (!upstream.ok) throw new Error(`engine predict http ${upstream.status}`);
+        const result = await upstream.json();
+        result.engine = { ...(result.engine || {}), proxied: true, via: ENGINE_BASE };
+        result.originalImageUrl = imageData || result.originalImageUrl;
+        result.heatmapOverlayUrl = imageData || result.heatmapOverlayUrl;
+        result.claheApplied = !!clahe;
+        result.noiseRemovalApplied = !!noiseRemoval;
+        result.calibration =
+          result.calibration || { applied: false, temperature: 1, method: 'identity', rawTopConfidence: result.topConfidence, calibratedTopConfidence: result.topConfidence };
+        result.uncertainty = result.uncertainty || { score: 40, level: 'moderate', method: 'margin-proxy' };
+        // Authoritative provenance: validation was performed server-side, never client-side.
+        result.workflow = 'upload';
+        result.validationSource = 'fastapi';
+        result.predictionGenerated = true;
+        // Report gating (Phase 14): low confidence or high uncertainty blocks
+        // the definitive report even after a successful validated inference.
+        result.reportAllowed =
+          (result.topConfidence ?? 0) >= config.confidenceThreshold &&
+          (result.uncertainty?.level ?? 'low') !== 'high';
+        recordPrediction(result);
+        auditDetail(res, 'predict', 'real-inference', result.reportAllowed ? 'ok' : 'low-confidence');
+        return res.json(result);
       } catch (upstreamErr) {
-        console.warn('PyTorch engine predict failed — falling back to simulation:', (upstreamErr as Error).message);
+        log.warn('engine-predict-failed', { error: (upstreamErr as Error).message });
+        auditDetail(res, 'predict', 'inference-failed', 'blocked');
+        // A real inference failure NEVER becomes a demo diagnosis.
+        return res.status(502).json({
+          ok: false,
+          status: 'inference_failed',
+          code: 'INFERENCE_FAILED',
+          message: 'The medical inference engine failed to produce a result. No prediction was generated.',
+          predictionGenerated: false,
+          reportAllowed: false,
+        });
       } finally {
         clearTimeout(timer);
       }
     }
 
+    // ------------------------------------------------------------------
+    // SAMPLE workflow — deterministic demo body (only reached when the
+    // request names one of the bundled demo studies). Always labelled.
+    // ------------------------------------------------------------------
     const startTime = Date.now();
 
     // Determine disease predictions using ML model logic / analysis
@@ -329,13 +783,13 @@ Ensure formal medical terminology (e.g., LUNGS, CARDIOMEDIASTINAL, PLEURA) and c
           if (parsed.recommendations && Array.isArray(parsed.recommendations)) recommendations = parsed.recommendations;
         }
       } catch (geminiErr) {
-        console.warn('Gemini report generation fallback:', geminiErr);
+        log.warn('gemini-report-fallback', { error: (geminiErr as Error).message });
       }
     }
 
     const elapsedTime = Date.now() - startTime + Math.floor(Math.random() * 30 + 100);
 
-    const result = {
+    const result: any = {
       id: `pred_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       timestamp: new Date().toISOString(),
       imageName: imageName || 'uploaded_chest_xray.png',
@@ -377,49 +831,149 @@ Ensure formal medical terminology (e.g., LUNGS, CARDIOMEDIASTINAL, PLEURA) and c
         contrastRatio: 4.9,
       },
       engine: {
+        // Canonical honest mode metadata — demo predictions never masquerade as real inference
+        engineMode: 'demo-engine',
         source: 'demo',
+        modelName: 'DenseNet-121 (CheXNet)',
+        modelVersion: APP_VERSION,
+        weightsLoaded: false,
+        predictionSource: 'demo-profile',
+        device: 'cpu',
         proxied: false,
-        reason: engine.status === 'offline' ? 'PyTorch engine offline' : 'Engine fallback',
+        reason: 'Sample/demo study — deterministic demo profile, not real inference',
       },
+      // Confidence calibration (identity unless MEDVISION_TEMPERATURE is set server-side)
+      calibration: {
+        applied: false,
+        temperature: 1.0,
+        method: 'identity',
+        rawTopConfidence: topDiag.probability,
+        calibratedTopConfidence: topDiag.probability,
+      },
+      // Uncertainty from the top-vs-second margin (server-side demo profile)
+      uncertainty: (() => {
+        const margin = topDiag.probability - (diseaseScores[1]?.probability || 0);
+        const score = Math.round(Math.min(100, Math.max(0, 100 - margin * 160 + 8)) * 10) / 10;
+        const level = score < 35 ? 'low' : score < 55 ? 'moderate' : 'high';
+        return { score, level, method: 'margin-proxy' };
+      })(),
+      typeCheck: null, // Node has no image decoder — FastAPI covers real uploads
+      quality: { score: 80, threshold: config.qualityThreshold },
+      ood: null,
     };
 
-    // Store in history
-    historyStore.unshift(result);
-    statsStore.totalPredictions += 1;
-    statsStore.severityDistribution[severity] = (statsStore.severityDistribution[severity] || 0) + 1;
-    statsStore.topDiseasesCount[topDiag.disease] = (statsStore.topDiseasesCount[topDiag.disease] || 0) + 1;
+    // SAMPLE workflow provenance — always explicit, never silent. Demo reports
+    // are labelled synthetic; export remains available for the explicit demo.
+    result.workflow = 'sample';
+    result.validationSource = 'sample-demo';
+    result.predictionGenerated = true;
+    result.reportAllowed = true;
 
+    recordPrediction(result);
+    auditDetail(res, 'predict', 'sample-demo', 'ok');
     res.json(result);
   } catch (error: any) {
-    console.error('Error in /api/predict:', error);
-    res.status(500).json({ error: error.message || 'Internal server error' });
+    log.error('predict-failed', { error: error.message || 'Internal server error' });
+    res.status(500).json({ error: error.message || 'Internal server error', predictionGenerated: false, reportAllowed: false });
   }
 });
 
-// POST /api/batch-predict
+// POST /api/batch-predict — same trust boundary as /api/predict.
+//   - mode: 'demo' → explicit demo workflow (the Batch UI is labeled DEMO MODE)
+//     returns clearly-flagged simulated profiles, never real inference.
+//   - otherwise → authoritative batch: the ML engine must be reachable and
+//     every item is server-side validated + inferred individually; items
+//     without image bytes or failing the gate are rejected individually.
 app.post('/api/batch-predict', async (req, res) => {
   try {
-    const { files } = req.body;
+    const { files, mode } = req.body;
     if (!files || !Array.isArray(files)) {
       return res.status(400).json({ error: 'Array of files is required' });
     }
+    const engine = await probeEngine();
 
-    const results = files.map((file: any, idx: number) => {
-      const isNormal = idx % 3 === 0;
-      const topDisease = isNormal ? 'No Finding' : idx % 2 === 0 ? 'Pneumonia' : 'Cardiomegaly';
-      const prob = isNormal ? 0.95 : 0.89;
-      return {
-        fileName: file.name || `xray_${idx + 1}.dcm`,
-        topDiagnosis: topDisease,
-        confidence: prob,
-        severity: isNormal ? 'Low' : 'High',
-        status: 'Completed',
-        inferenceMs: 120 + idx * 15,
-      };
-    });
+    // Explicitly-requested demo workflow — flagged, never silent.
+    if (mode === 'demo') {
+      const results = files.map((file: any, idx: number) => {
+        const isNormal = idx % 3 === 0;
+        const topDisease = isNormal ? 'No Finding' : idx % 2 === 0 ? 'Pneumonia' : 'Cardiomegaly';
+        const prob = isNormal ? 0.95 : 0.89;
+        return {
+          fileName: file.name || `xray_${idx + 1}.dcm`,
+          topDiagnosis: topDisease,
+          confidence: prob,
+          severity: isNormal ? 'Low' : 'High',
+          status: 'Completed',
+          inferenceMs: 120 + idx * 15,
+          demo: true,
+          validationSource: 'demo',
+        };
+      });
+      auditDetail(res, 'batch', 'demo-mode', 'ok');
+      return res.json({ success: true, count: results.length, demo: true, batchResults: results });
+    }
 
-    res.json({ success: true, count: results.length, batchResults: results });
+    // Authoritative batch — engine required, per-file server-side validation.
+    if (engine.status !== 'ready') {
+      auditDetail(res, 'batch', 'engine-offline', 'blocked');
+      return res.status(503).json({
+        ok: false,
+        status: 'engine_unavailable',
+        code: 'ML_ENGINE_UNAVAILABLE',
+        message: 'The medical inference engine is currently unavailable. No batch predictions were generated.',
+        predictionGenerated: false,
+        reportAllowed: false,
+      });
+    }
+
+    const results = [];
+    for (const file of files) {
+      if (typeof file.imageData !== 'string' || file.imageData === '') {
+        results.push({ fileName: file.name || 'unknown', status: 'error', error: 'INVALID_IMAGE: no image bytes supplied' });
+        continue;
+      }
+      const v = await validateViaEngine(file.name, file.imageData);
+      if (v.reason !== 'passed') {
+        monitor.rejectedImages += 1;
+        results.push({
+          fileName: file.name || 'unknown',
+          status: 'error',
+          error: 'VALIDATION_FAILED',
+          validation: v.reason === 'gate-failed' ? v.validation : undefined,
+        });
+        continue;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12_000);
+      try {
+        const upstream = await fetch(`${ENGINE_BASE}/api/predict`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ imageName: file.name, imageData: file.imageData, model: file.model || 'DenseNet121' }),
+          signal: controller.signal,
+        });
+        if (!upstream.ok) throw new Error(`engine predict http ${upstream.status}`);
+        const r = await upstream.json();
+        results.push({
+          fileName: file.name || 'unknown',
+          topDiagnosis: r.topDiagnosis,
+          confidence: r.topConfidence,
+          severity: r.severity,
+          status: 'Completed',
+          inferenceMs: Math.round(r.inferenceTimeMs || 0),
+          validationSource: 'fastapi',
+        });
+        monitor.predictions += 1;
+      } catch {
+        results.push({ fileName: file.name || 'unknown', status: 'error', error: 'INFERENCE_FAILED' });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    auditDetail(res, 'batch', 'authoritative', 'ok');
+    res.json({ success: true, count: results.length, demo: false, batchResults: results });
   } catch (err: any) {
+    log.error('batch-predict-failed', { error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
@@ -428,47 +982,22 @@ app.post('/api/batch-predict', async (req, res) => {
 // Enterprise Suite Endpoints (additive — existing APIs untouched)
 // ---------------------------------------------------------------------------
 
-// POST /api/auth/login — JWT session (email+password) with legacy name-only fallback
-app.post('/api/auth/login', (req, res) => {
-  const { email, password, name } = req.body || {};
-
-  if (email && password) {
-    const user = MOCK_USERS.find(
-      (u) => u.email.toLowerCase() === String(email).toLowerCase() && u.password === String(password)
-    );
-    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
-    const token = signToken({ sub: user.id, role: user.role, name: user.name });
-    return res.json({
-      success: true,
-      token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
-    });
-  }
-
-  // Legacy quick login (name only) — preserved for backward compatibility
-  const role = name?.toLowerCase().includes('admin') ? 'Admin' : name?.toLowerCase().includes('research') ? 'Researcher' : 'Radiologist';
-  const token = signToken({ sub: `u_${String(name || 'guest').toLowerCase().replace(/\s/g, '_')}`, role, name: name || 'Dr. Ayesha Vance' });
-  res.json({ success: true, token, user: { name: name || 'Dr. Ayesha Vance', role } });
+// GET /api/audit-logs — public security audit trail. Open in public research
+// mode (no authentication); entries are anonymized (actor: "anonymous").
+// Pre-v2.7 rows (from the JWT era) carry a legacy `role` field — normalized so
+// every entry exposes an `actor`.
+app.get('/api/audit-logs', (_req, res) => {
+  const entries = auditStore.slice(0, 200).map((e: any) => ({ ...e, actor: e.actor ?? 'legacy' }));
+  res.json({ success: true, count: entries.length, entries, actor: 'anonymous' });
 });
 
-// GET /api/auth/me — restore session from Bearer token
-app.get('/api/auth/me', (req, res) => {
-  const auth = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  const payload = verifyToken(auth);
-  if (!payload) return res.status(401).json({ error: 'Invalid or expired session' });
-  res.json({
-    success: true,
-    user: {
-      id: payload.sub,
-      name: payload.name || 'MedVision User',
-      role: payload.role || 'Radiologist',
-    },
+// Authentication routes intentionally removed — MedVision AI is a public
+// research/education platform (no login, logout, JWT, or accounts). Legacy
+// auth calls now receive an explicit 404 with guidance.
+app.all('/api/auth/*', (req, res) => {
+  res.status(404).json({
+    error: 'Authentication is not used by MedVision AI. The platform runs in public research mode with no login or accounts.',
   });
-});
-
-// POST /api/auth/logout
-app.post('/api/auth/logout', (_req, res) => {
-  res.json({ success: true });
 });
 
 // GET /api/dashboard — enterprise KPI snapshot
@@ -581,7 +1110,7 @@ Respond to the user's question directly using structured Markdown (headers, bull
           });
         }
       } catch (geminiErr) {
-        console.warn('Gemini chat error, falling back to expert rules engine:', geminiErr);
+        log.warn('gemini-chat-fallback', { error: (geminiErr as Error).message });
       }
     }
 
@@ -714,10 +1243,28 @@ I can explain the **disease mechanism**, **Grad-CAM heatmap regions**, **confide
       timestamp: new Date().toISOString(),
     });
   } catch (err: any) {
-    console.error('Error in /api/chat:', err);
+    log.error('chat-failed', { error: err.message || 'Failed to process chat message' });
     res.status(500).json({ error: err.message || 'Failed to process chat message' });
   }
 });
+
+// Load persisted state (history + audit) at boot, then start listening.
+// Awaited so early requests can never race the PG/JSON restore.
+async function boot() {
+  // Validate environment — fail fast in production with meaningful messages
+  const problems = validateConfig();
+  for (const p of problems) log.warn('config', { problem: p });
+  if (problems.length > 0 && config.nodeEnv === 'production') {
+    log.error('config-validation-failed-in-production', { problems });
+    process.exit(1);
+  }
+  try {
+    await initStorage(historyStore, auditStore);
+  } catch (err) {
+    log.warn('storage-init-failed', { error: (err as Error).message });
+  }
+  await startServer();
+}
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
@@ -741,8 +1288,14 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`MedVision AI Server running at http://0.0.0.0:${PORT}`);
+    log.info('server-started', {
+      name: APP_NAME,
+      version: APP_VERSION,
+      port: PORT,
+      env: config.nodeEnv,
+      engine: ENGINE_BASE,
+    });
   });
 }
 
-startServer();
+boot();

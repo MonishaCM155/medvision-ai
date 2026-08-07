@@ -26,6 +26,24 @@ const TOOLTIP_STYLE = {
   color: '#f8fafc',
 };
 
+const PROVENANCE_META: Record<HubModel['source'], { label: string; cls: string; title: string }> = {
+  published: {
+    label: 'PUBLISHED',
+    cls: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/25',
+    title: 'Metrics from a peer-reviewed paper or official benchmark',
+  },
+  estimated: {
+    label: 'ESTIMATED',
+    cls: 'bg-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/25',
+    title: 'Extrapolated from comparable published models — no direct paper',
+  },
+  synthetic: {
+    label: 'DEMO',
+    cls: 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/25',
+    title: 'Internal demo value — not from a published benchmark',
+  },
+};
+
 export const ModelHub: React.FC = () => {
   const [models, setModels] = useState<HubModel[]>([]);
   const [task, setTask] = useState<ModelTask | 'All'>('All');
@@ -122,6 +140,17 @@ export const ModelHub: React.FC = () => {
         ))}
       </div>
 
+      {/* Provenance legend */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10px] text-slate-500 dark:text-slate-400">
+        <span className="font-semibold text-slate-600 dark:text-slate-300">Metric provenance:</span>
+        {(['published', 'estimated', 'synthetic'] as const).map((s) => (
+          <span key={s} className="inline-flex items-center gap-1.5">
+            <span className={cn('w-2 h-2 rounded-full border', PROVENANCE_META[s].cls.split(' ')[0])} />
+            {PROVENANCE_META[s].label} — {PROVENANCE_META[s].title.toLowerCase()}
+          </span>
+        ))}
+      </div>
+
       {/* Model cards */}
       {models.length === 0 ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -169,6 +198,12 @@ export const ModelHub: React.FC = () => {
                           PROD
                         </span>
                       )}
+                      <span
+                        title={`${PROVENANCE_META[m.source].title}${m.reference ? ` — ${m.reference}` : ''}`}
+                        className={cn('text-[9px] font-mono font-bold px-1.5 py-0.5 rounded-full border', PROVENANCE_META[m.source].cls)}
+                      >
+                        {PROVENANCE_META[m.source].label}
+                      </span>
                     </div>
                   </div>
                 </div>

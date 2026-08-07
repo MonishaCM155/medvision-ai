@@ -135,6 +135,9 @@ export const Patients: React.FC = () => {
         <div>
           <h1 className="text-xl font-black tracking-tight text-slate-900 dark:text-white">Patient Management</h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Complete EHR-style patient records, visits, and AI-assisted timelines</p>
+          <span className="mt-2 inline-flex items-center gap-1.5 text-[10px] font-mono font-bold text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-full px-2.5 py-1">
+            <AlertTriangle className="w-3 h-3" /> DEMO REGISTRY — ALL PATIENT RECORDS ARE SYNTHETIC SAMPLE DATA
+          </span>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -356,6 +359,9 @@ const PatientProfile: React.FC<{ detail: PatientDetail; onClose: () => void }> =
         <div className="flex items-center gap-2">
           <span className="text-[10px] font-mono text-slate-400 flex items-center gap-1">
             <ShieldCheck className="w-3 h-3 text-emerald-500" /> EHR #{p.id.replace('PAT-', '')}
+          </span>
+          <span className="inline-flex items-center gap-1 text-[9px] font-mono font-bold text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-full px-2 py-0.5">
+            SYNTHETIC DATA
           </span>
           <button
             onClick={() => pushNotification({ kind: 'success', title: 'Record updated', body: `${p.id} — ${p.name} record saved to EHR.` })}

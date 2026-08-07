@@ -1,7 +1,8 @@
 {
-  "name": "react-example",
+  "name": "medvision-ai",
   "private": true,
-  "version": "0.0.0",
+  "version": "2.7.0",
+  "description": "MedVision AI — explainable enterprise medical imaging platform (chest X-ray analysis, Grad-CAM, AI safety pipeline, public research mode, MLOps)",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",

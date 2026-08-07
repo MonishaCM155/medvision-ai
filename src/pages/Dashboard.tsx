@@ -5,11 +5,12 @@ import {
 } from 'recharts';
 import {
   ScanLine, FileClock, Siren, Users, Target, Zap, Cpu, Gauge, BellRing,
-  ArrowRight, Bot, ShieldCheck, Database, TrendingUp, BrainCircuit, Lock,
+  ArrowRight, Bot, ShieldCheck, Database, TrendingUp, BrainCircuit,
+  Activity, Server, AlertTriangle, Ban, MemoryStick, RefreshCw, FlaskConical,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { api } from '../services/api';
-import { DashboardStats, ActivityEvent } from '../types';
+import { DashboardStats, ActivityEvent, MonitoringSnapshot } from '../types';
 import { ACTIVITY_FEED } from '../data/mockEnterprise';
 import { StatCard } from '../components/ui/StatCard';
 import { GlassCard, SectionHeader, LiveBadge, SeverityPill } from '../components/ui/GlassCard';
@@ -33,10 +34,10 @@ const ACTIVITY_ICON: Record<ActivityEvent['type'], React.ReactNode> = {
 };
 
 export const Dashboard: React.FC<{ onNavigate: (tab: string) => void }> = ({ onNavigate }) => {
-  const { user, can, pushNotification } = useApp();
-  const isAdmin = can('Admin');
+  const { user, pushNotification } = useApp();
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [activity] = useState<ActivityEvent[]>(ACTIVITY_FEED);
+  const [monitor, setMonitor] = useState<MonitoringSnapshot | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -45,6 +46,22 @@ export const Dashboard: React.FC<{ onNavigate: (tab: string) => void }> = ({ onN
     });
     return () => {
       mounted = false;
+    };
+  }, []);
+
+  // Poll live server telemetry every 5s (falls back to offline snapshot when the API is down)
+  useEffect(() => {
+    let mounted = true;
+    const tick = () => {
+      api.getMonitoring().then((m) => {
+        if (mounted) setMonitor(m);
+      });
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => {
+      mounted = false;
+      clearInterval(id);
     };
   }, []);
 
@@ -72,10 +89,10 @@ export const Dashboard: React.FC<{ onNavigate: (tab: string) => void }> = ({ onN
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-xl font-black tracking-tight text-slate-900 dark:text-white">
-            Good {new Date().getHours() < 12 ? 'morning' : new Date().getHours() < 18 ? 'afternoon' : 'evening'}, <span className="text-gradient">{user.name.split(' ').slice(-1)[0]}</span> 👋
+            Good {new Date().getHours() < 12 ? 'morning' : new Date().getHours() < 18 ? 'afternoon' : 'evening'} 👋
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            {today} · {user.department} · All systems nominal
+            {today} · {user.department} · KPI dashboard shows <strong className="font-semibold text-slate-600 dark:text-slate-300">simulated demo data</strong>
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -324,18 +341,10 @@ export const Dashboard: React.FC<{ onNavigate: (tab: string) => void }> = ({ onN
             title="Prediction Queue"
             right={
               <button
-                onClick={() =>
-                  isAdmin
-                    ? pushNotification({ kind: 'success', title: 'Queue flushed', body: 'All queued predictions completed successfully.' })
-                    : pushNotification({ kind: 'warning', title: 'Admin access required', body: 'Only Admins can flush the inference queue. Switch to an Admin session in Settings → Security.' })
-                }
-                className={cn(
-                  'text-[10px] font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors',
-                  isAdmin ? 'text-slate-400 hover:text-primary-500' : 'text-slate-400/70 hover:text-amber-500'
-                )}
-                title={isAdmin ? 'Flush the inference queue' : 'Admin-only action — current role lacks permission'}
+                onClick={() => pushNotification({ kind: 'success', title: 'Queue flushed', body: 'All queued predictions completed successfully. (Simulated demo action — no accounts or permissions are enforced.)' })}
+                className="text-[10px] font-semibold inline-flex items-center gap-1 text-slate-400 hover:text-primary-500 cursor-pointer transition-colors"
+                title="Flush the simulated inference queue (public demo action)"
               >
-                {!isAdmin && <Lock className="w-3 h-3" />}
                 Flush
               </button>
             }
@@ -358,11 +367,72 @@ export const Dashboard: React.FC<{ onNavigate: (tab: string) => void }> = ({ onN
             ))}
             <div className="flex items-center gap-2 text-[10px] text-slate-400 mt-2 pt-2 border-t border-slate-100 dark:border-slate-800">
               <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
-              <span>All predictions verified against model registry v2.4.1</span>
+              <span>All predictions verified against model registry v2.7.0</span>
             </div>
           </div>
         </GlassCard>
       </div>
+
+      {/* Live server monitor — real telemetry from GET /api/monitoring */}
+      <GlassCard>
+        <SectionHeader
+          icon={<Activity className="w-4 h-4 text-emerald-500" />}
+          title="Live System Monitor"
+          subtitle="Real-time telemetry from the MedVision server — not simulated"
+          right={
+            <span className="inline-flex items-center gap-1.5 text-[10px] font-mono text-emerald-600 dark:text-emerald-400">
+              <RefreshCw className="w-3 h-3 animate-spin-slow" />
+              {monitor ? `polling · ${new Date(monitor.timestamp).toLocaleTimeString()}` : 'connecting…'}
+            </span>
+          }
+        />
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 mt-4">
+          {[
+            { label: 'Service', value: monitor ? monitor.service : '—', sub: monitor ? `v${monitor.version}` : '', icon: <Server className="w-3.5 h-3.5" />, color: 'text-indigo-500' },
+            { label: 'Uptime', value: monitor ? formatUptime(monitor.uptimeSec) : '—', sub: 'since boot', icon: <Activity className="w-3.5 h-3.5" />, color: 'text-emerald-500' },
+            { label: 'Requests', value: monitor ? monitor.requests.toLocaleString() : '—', sub: `${monitor?.requestsPerMinute ?? 0}/min`, icon: <Zap className="w-3.5 h-3.5" />, color: 'text-sky-500' },
+            { label: 'Errors', value: String(monitor?.errors ?? '—'), sub: monitor?.errors ? 'needs review' : 'none', icon: <AlertTriangle className="w-3.5 h-3.5" />, color: monitor?.errors ? 'text-rose-500' : 'text-slate-400' },
+            { label: 'Rejected Images', value: String(monitor?.rejectedImages ?? '—'), sub: 'safety gate', icon: <Ban className="w-3.5 h-3.5" />, color: 'text-amber-500' },
+            { label: 'Predictions', value: String(monitor?.predictions ?? '—'), sub: monitor?.avgInferenceMs ? `${monitor.avgInferenceMs.toFixed(0)}ms avg` : 'no load', icon: <BrainCircuit className="w-3.5 h-3.5" />, color: 'text-violet-500' },
+            { label: 'Public Mode', value: 'No login', sub: 'open research platform', icon: <FlaskConical className="w-3.5 h-3.5" />, color: 'text-fuchsia-500' },
+            { label: 'Memory', value: monitor ? `${monitor.memory.rssMb.toFixed(0)}MB` : '—', sub: `heap ${monitor?.memory.heapUsedMb.toFixed(0) ?? 0}MB`, icon: <MemoryStick className="w-3.5 h-3.5" />, color: 'text-teal-500' },
+          ].map((t) => (
+            <div key={t.label} className="rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-100 dark:border-slate-700/60 p-2.5 space-y-1">
+              <div className="flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-widest text-slate-400">
+                <span className={t.color}>{t.icon}</span>
+                {t.label}
+              </div>
+              <p className="text-sm font-black font-mono text-slate-900 dark:text-white truncate">{t.value}</p>
+              <p className="text-[9px] font-mono text-slate-400 truncate">{t.sub}</p>
+            </div>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 mt-3 pt-3 border-t border-slate-100 dark:border-slate-800 text-[10px] font-mono text-slate-500 dark:text-slate-400">
+          <span className="inline-flex items-center gap-1.5">
+            <span className={cn('w-1.5 h-1.5 rounded-full', monitor?.status === 'offline' ? 'bg-rose-500' : 'bg-emerald-500 animate-pulse')} />
+            API {monitor?.status === 'offline' ? 'OFFLINE' : 'HEALTHY'}
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <BrainCircuit className="w-3 h-3" />
+            Engine: {monitor ? `${monitor.engine.status.toUpperCase()} · ${monitor.engine.source} · ${monitor.engine.device}` : '—'}
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <Cpu className="w-3 h-3" />
+            CPU {monitor ? `${(monitor.cpu.user + monitor.cpu.system).toFixed(0)}%` : '—'}
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <Database className="w-3 h-3" />
+            Model {monitor?.modelVersion ?? '—'} · Storage {monitor?.storage ?? '—'}
+          </span>
+        </div>
+      </GlassCard>
     </div>
   );
 };
+
+function formatUptime(sec: number): string {
+  if (sec < 60) return `${sec}s`;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}

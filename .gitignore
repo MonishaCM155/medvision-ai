@@ -2,7 +2,27 @@ node_modules/
 build/
 dist/
 coverage/
+
 .DS_Store
 *.log
-.env*
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime/generated data
+data/
+.freebuff/
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets
+.env
+.env.*
 !.env.example

@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useState, useCallback, useRef } from 'react';
-import { AppNotification, AuthSession, AuthUser, EngineStatus, SessionUser, UserRole } from '../types';
-import { AVAILABLE_ROLES, DEFAULT_USER, SEED_NOTIFICATIONS } from '../data/mockEnterprise';
+import { AppNotification, EngineStatus, SessionUser } from '../types';
+import { DEFAULT_USER, SEED_NOTIFICATIONS } from '../data/mockEnterprise';
 import { api } from '../services/api';
 import { uid } from '../utils/format';
 
@@ -17,12 +17,8 @@ interface AppContextValue {
   theme: ThemeMode;
   toggleTheme: () => void;
   setTheme: (mode: ThemeMode) => void;
+  /** Static public-research identity — MedVision AI has no user accounts. */
   user: SessionUser;
-  switchUser: (user: SessionUser) => void;
-  session: AuthSession | null;
-  login: (email: string, password: string) => Promise<AuthSession>;
-  logout: () => void;
-  can: (...roles: UserRole[]) => boolean;
   engine: EngineStatus | null;
   refreshEngine: () => Promise<EngineStatus>;
   notifications: AppNotification[];
@@ -35,6 +31,9 @@ interface AppContextValue {
   dismissToast: (id: string) => void;
   sidebarCollapsed: boolean;
   toggleSidebar: () => void;
+  /** Minimum AI confidence for a definitive diagnosis (0.5–0.95). */
+  confidenceThreshold: number;
+  setConfidenceThreshold: (value: number) => void;
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
@@ -49,30 +48,32 @@ function getInitialTheme(): ThemeMode {
   return 'light';
 }
 
+const DEFAULT_CONFIDENCE_THRESHOLD = 0.75;
+
+function getInitialThreshold(): number {
+  try {
+    const saved = Number(localStorage.getItem('medvision-confidence-threshold'));
+    if (Number.isFinite(saved) && saved >= 0.5 && saved <= 0.95) return saved;
+  } catch {
+    /* ignore */
+  }
+  return DEFAULT_CONFIDENCE_THRESHOLD;
+}
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [theme, setThemeState] = useState<ThemeMode>(getInitialTheme);
-  const [user, setUser] = useState<SessionUser>(DEFAULT_USER);
+  // Static public-research identity — MedVision AI has no accounts, so there is
+  // no user state to mutate (deliberately not a useState).
+  const user = DEFAULT_USER;
   const [notifications, setNotifications] = useState<AppNotification[]>(SEED_NOTIFICATIONS);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [session, setSession] = useState<AuthSession | null>(null);
   const [engine, setEngine] = useState<EngineStatus | null>(null);
+  const [confidenceThreshold, setConfidenceThresholdState] = useState<number>(getInitialThreshold);
   const pushCounter = useRef(0);
-  const sessionEpoch = useRef(0); // bumped on logout to invalidate in-flight restore promises
 
-  // Restore persisted session + probe the PyTorch engine on mount
+  // Probe the PyTorch engine on mount and keep the badge fresh
   useEffect(() => {
-    const token = localStorage.getItem('medvision-token');
-    if (token) {
-      const epoch = sessionEpoch.current;
-      api.getMe(token).then(({ user }) => {
-        // Ignore if the user logged out while the request was in flight
-        if (epoch !== sessionEpoch.current) return;
-        setSession({ token, user: user as AuthUser });
-      }).catch(() => {
-        if (epoch === sessionEpoch.current) localStorage.removeItem('medvision-token');
-      });
-    }
     api.getEngineStatus().then(setEngine).catch(() => setEngine(null));
     const poll = setInterval(() => {
       api.getEngineStatus().then(setEngine).catch(() => undefined);
@@ -85,29 +86,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setEngine(status);
     return status;
   }, []);
-
-  const login = useCallback(async (email: string, password: string) => {
-    const next = await api.loginWithPassword(email, password);
-    localStorage.setItem('medvision-token', next.token);
-    setSession(next);
-    return next;
-  }, []);
-
-  const logout = useCallback(() => {
-    sessionEpoch.current += 1; // invalidate any in-flight restore
-    api.logout().catch(() => undefined);
-    localStorage.removeItem('medvision-token');
-    setSession(null);
-  }, []);
-
-  // Role check: authenticated session takes precedence, demo role switcher as fallback
-  const can = useCallback(
-    (...roles: UserRole[]): boolean => {
-      const role = (session?.user.role || user.role) as UserRole;
-      return roles.includes(role);
-    },
-    [session, user]
-  );
 
   // Apply theme class to <html>
   useEffect(() => {
@@ -123,7 +101,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const setTheme = useCallback((mode: ThemeMode) => setThemeState(mode), []);
   const toggleTheme = useCallback(() => setThemeState((t) => (t === 'dark' ? 'light' : 'dark')), []);
 
-  const switchUser = useCallback((next: SessionUser) => setUser(next), []);
+  const setConfidenceThreshold = useCallback((value: number) => {
+    const clamped = Math.min(0.95, Math.max(0.5, value));
+    setConfidenceThresholdState(clamped);
+    try {
+      localStorage.setItem('medvision-confidence-threshold', String(clamped));
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const markAllRead = useCallback(() => {
     setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
@@ -173,11 +159,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       toggleTheme,
       setTheme,
       user,
-      switchUser,
-      session,
-      login,
-      logout,
-      can,
       engine,
       refreshEngine,
       notifications,
@@ -190,8 +171,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       dismissToast,
       sidebarCollapsed,
       toggleSidebar: () => setSidebarCollapsed((c) => !c),
+      confidenceThreshold,
+      setConfidenceThreshold,
     }),
-    [theme, toggleTheme, setTheme, user, switchUser, session, login, logout, can, engine, refreshEngine, notifications, unreadCount, markAllRead, markRead, pushNotification, dismissNotification, toasts, dismissToast, sidebarCollapsed]
+    [theme, toggleTheme, setTheme, user, engine, refreshEngine, notifications, unreadCount, markAllRead, markRead, pushNotification, dismissNotification, toasts, dismissToast, sidebarCollapsed, confidenceThreshold, setConfidenceThreshold]
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
@@ -202,5 +185,3 @@ export function useApp(): AppContextValue {
   if (!ctx) throw new Error('useApp must be used within AppProvider');
   return ctx;
 }
-
-export { AVAILABLE_ROLES };

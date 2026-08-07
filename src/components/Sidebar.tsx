@@ -199,7 +199,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onNavigate, onToggl
             ))}
           </div>
           <p className="mt-2 px-1 text-[9px] text-slate-400 font-mono truncate">
-            {user.name} · {user.role}
+            {user.name} · {user.department}
           </p>
         </div>
       )}

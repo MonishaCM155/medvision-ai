@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { FileText, ShieldAlert, Sparkles, Download, Activity, Calendar, User, UserCheck, ChevronDown, GitBranch, Stethoscope, QrCode, FlaskConical } from 'lucide-react';
-import { RadiologyReport, SeverityLevel, DiseaseProbability } from '../types';
+import { FileText, ShieldAlert, Download, ChevronDown, GitBranch, Stethoscope, QrCode, FlaskConical, Lock, AlertTriangle, Activity } from 'lucide-react';
+import { RadiologyReport, SeverityLevel, DiseaseProbability, CalibrationInfo, UncertaintyInfo } from '../types';
 import { suggestedTests, generateQrSvg } from '../utils/qr';
 import { cn } from '../utils/cn';
 
@@ -13,6 +13,14 @@ interface ReportCardProps {
   onExportPdf: () => void;
   isExporting?: boolean;
   diseases?: DiseaseProbability[];
+  /** Export (PDF/DOCX/QR) is locked until a validated chest X-ray has been analyzed. */
+  canExport?: boolean;
+  /** True when top confidence is below the configured clinical threshold. */
+  lowConfidence?: boolean;
+  /** Temperature-scaled calibration info from the safety pipeline. */
+  calibration?: CalibrationInfo;
+  /** Predictive uncertainty (MC-dropout or margin proxy). */
+  uncertainty?: UncertaintyInfo;
 }
 
 export const ReportCard: React.FC<ReportCardProps> = ({
@@ -24,6 +32,10 @@ export const ReportCard: React.FC<ReportCardProps> = ({
   onExportPdf,
   isExporting = false,
   diseases = [],
+  canExport = true,
+  lowConfidence = false,
+  calibration,
+  uncertainty,
 }) => {
   const [explainOpen, setExplainOpen] = useState(false);
 
@@ -59,21 +71,58 @@ export const ReportCard: React.FC<ReportCardProps> = ({
           <p className="text-xs text-slate-500 mt-0.5">Automated clinical report synthesis based on spatial visual activations.</p>
         </div>
 
-        <button
-          onClick={onExportPdf}
-          disabled={isExporting}
-          className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-md shadow-xs flex items-center justify-center gap-2 cursor-pointer transition-colors disabled:opacity-50"
-        >
-          <Download className="w-4 h-4" />
-          <span>{isExporting ? 'Generating PDF...' : 'Download Hospital PDF Report'}</span>
-        </button>
+        {canExport ? (
+          <button
+            onClick={onExportPdf}
+            disabled={isExporting}
+            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-md shadow-xs flex items-center justify-center gap-2 cursor-pointer transition-colors disabled:opacity-50"
+          >
+            <Download className="w-4 h-4" />
+            <span>{isExporting ? 'Generating PDF...' : 'Download Hospital PDF Report'}</span>
+          </button>
+        ) : (
+          <button
+            disabled
+            title="Run a validated chest X-ray analysis to unlock PDF/DOCX/QR export"
+            className="px-4 py-2 bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 font-bold text-xs rounded-md shadow-xs flex items-center justify-center gap-2 cursor-not-allowed border border-slate-300 dark:border-slate-600"
+          >
+            <Lock className="w-4 h-4" />
+            <span>Report export locked</span>
+          </button>
+        )}
       </div>
+
+      {/* High-uncertainty notice — never present an uncertain prediction as definitive */}
+      {uncertainty && uncertainty.level === 'high' && (
+        <div className="flex items-start gap-2.5 bg-rose-50 dark:bg-rose-500/10 border border-rose-300 dark:border-rose-500/40 rounded-lg p-3 text-[11px] text-rose-800 dark:text-rose-200 animate-fade-in">
+          <Activity className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+          <p className="leading-relaxed">
+            <strong>AI confidence insufficient for reliable diagnosis.</strong> Predictive uncertainty is high
+            ({uncertainty.score}/100 — {uncertainty.method}). The model is not certain enough about this study;
+            treat the output as advisory and obtain a repeat or follow-up examination.
+          </p>
+        </div>
+      )}
+
+      {/* Low-confidence notice — never present a weak prediction as definitive */}
+      {lowConfidence && (
+        <div className="flex items-start gap-2.5 bg-amber-50 dark:bg-amber-500/10 border border-amber-300 dark:border-amber-500/40 rounded-lg p-3 text-[11px] text-amber-800 dark:text-amber-200 animate-fade-in">
+          <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+          <p className="leading-relaxed">
+            <strong>Low-confidence prediction:</strong> the model reached only{' '}
+            <strong>{(topConfidence * 100).toFixed(1)}%</strong> confidence for {topDiagnosis}, below the
+            configured clinical threshold. This report must be treated as{' '}
+            <strong>indeterminate</strong> — recommend re-capture or follow-up imaging before any decision.
+          </p>
+        </div>
+      )}
 
       {/* Patient Header Strip */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 p-3 rounded-lg border border-slate-200 text-xs font-mono">
         <div>
           <span className="text-slate-500 block text-[10px]">PATIENT ID:</span>
           <span className="text-slate-900 font-bold">{report.patientId}</span>
+          <span className="mt-1 inline-flex items-center gap-1 text-[9px] font-bold font-mono text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-full px-1.5 py-0.5">SYNTHETIC</span>
         </div>
         <div>
           <span className="text-slate-500 block text-[10px]">AGE / SEX:</span>
@@ -88,6 +137,42 @@ export const ReportCard: React.FC<ReportCardProps> = ({
           <span className="text-indigo-700 font-bold">{topDiagnosis} ({(topConfidence * 100).toFixed(0)}%)</span>
         </div>
       </div>
+
+      {/* Confidence calibration & uncertainty (AI safety pipeline) */}
+      {(calibration || uncertainty) && (
+        <div className="bg-slate-50 p-4 rounded-lg border border-slate-200 space-y-2.5">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-semibold text-slate-700 flex items-center gap-1.5">
+              <Activity className="w-3.5 h-3.5 text-indigo-500" /> AI Confidence & Uncertainty
+            </span>
+            {uncertainty && (
+              <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border font-mono ${
+                uncertainty.level === 'high' ? 'bg-rose-500/10 text-rose-600 dark:text-rose-400 border-rose-500/30' : uncertainty.level === 'moderate' ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
+              }`}>
+                UNCERTAINTY {uncertainty.score}/100 · {uncertainty.level.toUpperCase()}
+              </span>
+            )}
+          </div>
+          {calibration && (
+            <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+              <span className="text-slate-500">Raw confidence:</span>
+              <span className="font-bold text-slate-800">{(calibration.rawTopConfidence * 100).toFixed(1)}%</span>
+              {calibration.applied ? (
+                <>
+                  <span className="text-slate-400">→</span>
+                  <span className="font-bold text-indigo-600 dark:text-indigo-400">Calibrated: {(calibration.calibratedTopConfidence * 100).toFixed(1)}%</span>
+                  <span className="text-slate-400">(T={calibration.temperature}, {calibration.method})</span>
+                </>
+              ) : (
+                <span className="text-slate-400">= calibrated (identity, T=1.0)</span>
+              )}
+            </div>
+          )}
+          {uncertainty?.method && (
+            <p className="text-[10px] text-slate-400 font-mono">uncertainty method: {uncertainty.method}{uncertainty.samples ? ` · ${uncertainty.samples} MC samples` : ''}</p>
+          )}
+        </div>
+      )}
 
       {/* Severity Score Indicator Gauge */}
       <div className="bg-slate-50 p-4 rounded-lg border border-slate-200 space-y-2">
@@ -233,15 +318,23 @@ export const ReportCard: React.FC<ReportCardProps> = ({
           )}
         </div>
 
-        {/* Verification strip */}
+        {/* Verification strip (QR generated only after a validated analysis) */}
         <div className="flex flex-col sm:flex-row sm:items-center gap-3 bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700 rounded-lg p-3">
-          <img src={generateQrSvg(report.patientId)} alt="Verification QR" className="w-12 h-12 rounded bg-white border border-slate-200 p-0.5 shrink-0" />
+          {canExport ? (
+            <img src={generateQrSvg(report.patientId)} alt="Verification QR" className="w-12 h-12 rounded bg-white border border-slate-200 p-0.5 shrink-0" />
+          ) : (
+            <div className="w-12 h-12 rounded bg-slate-200 dark:bg-slate-700 border border-slate-300 dark:border-slate-600 flex items-center justify-center shrink-0">
+              <Lock className="w-4 h-4 text-slate-400 dark:text-slate-500" />
+            </div>
+          )}
           <div className="flex-1">
             <p className="text-[11px] font-bold text-slate-700 dark:text-slate-200 flex items-center gap-1.5">
               <QrCode className="w-3.5 h-3.5 text-slate-400" /> Report Verification
             </p>
             <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-0.5">
-              Scan to verify authenticity of report <span className="font-mono">{report.patientId}</span>. Signed by <strong>{'MedVision AI v2.5'}</strong>.
+              {canExport
+                ? `Scan to verify authenticity of report ${report.patientId}. Signed by MedVision AI v2.7.`
+                : 'Scan-to-verify QR unlocks after a validated chest X-ray analysis.'}
             </p>
           </div>
           <span className="inline-flex items-center gap-1 text-[10px] font-mono text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border border-emerald-500/25 rounded-full px-2.5 py-1 shrink-0">

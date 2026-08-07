@@ -1,12 +1,12 @@
 import {
-  AuthSession,
-  AuthUser,
   DashboardStats,
   DatasetInfo,
   EngineStatus,
   HubModel,
+  MonitoringSnapshot,
   PatientDetail,
   PatientRecord,
+  SafetyReport,
   TrainingRun,
 } from '../types';
 import {
@@ -52,23 +52,36 @@ export const api = {
 
   getEngineStatus: (): Promise<EngineStatus> => fetchJson<EngineStatus>('/api/engine'),
 
-  login: (name: string): Promise<AuthSession> =>
-    fetchJson<AuthSession>('/api/auth/login', {
+  /** AI Safety Gate — image-type classification + OOD + quality scoring. */
+  validateImage: (payload: {
+    imageName?: string;
+    imageData?: string;
+    clientValidation?: { passed: boolean; score: number };
+  }): Promise<SafetyReport> =>
+    fetchJson<SafetyReport>('/api/validate', {
       method: 'POST',
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(payload),
     }),
 
-  loginWithPassword: (email: string, password: string): Promise<AuthSession> =>
-    fetchJson<AuthSession>('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    }),
+  /** Live operational telemetry (uptime, memory, engine, rejections…). */
+  getMonitoring: (): Promise<MonitoringSnapshot> =>
+    fetchJson<MonitoringSnapshot>('/api/monitoring').catch(() => ({
+      service: 'MedVision AI Server',
+      version: '—',
+      status: 'offline',
+      uptimeSec: 0,
+      requests: 0,
+      requestsPerMinute: 0,
+      errors: 0,
+      rejectedImages: 0,
+      predictions: 0,
+      avgInferenceMs: null,
+      engine: { status: 'offline', source: 'unknown', device: 'unknown' },
+      modelVersion: '—',
+      storage: '—',
+      memory: { rssMb: 0, heapUsedMb: 0, heapTotalMb: 0 },
+      cpu: { user: 0, system: 0 },
+      timestamp: new Date().toISOString(),
+    })),
 
-  getMe: (token: string): Promise<{ success: boolean; user: AuthUser }> =>
-    fetchJson<{ success: boolean; user: AuthUser }>('/api/auth/me', {
-      headers: { Authorization: `Bearer ${token}` },
-    }),
-
-  logout: (): Promise<{ success: boolean }> =>
-    fetchJson<{ success: boolean }>('/api/auth/logout', { method: 'POST' }),
 };

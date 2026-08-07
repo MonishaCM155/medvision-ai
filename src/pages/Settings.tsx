@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import {
   Palette, Cpu, Bell, FileText, User, Accessibility, Languages, Check, Save,
-  Monitor, Moon, Sun, ShieldCheck, Sparkles, KeyRound, LogOut, Lock, LogIn,
+  Monitor, Moon, Sun, ShieldCheck, Sparkles, Globe, FlaskConical,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { GlassCard, SectionHeader } from '../components/ui/GlassCard';
@@ -42,20 +42,8 @@ const ToggleRow: React.FC<ToggleRowProps> = ({ label, description, checked, onCh
 
 const SECTION_ICON = { className: 'w-4 h-4 text-primary-500' };
 
-const DEMO_ACCOUNTS = [
-  { email: 'admin@medvision.ai', password: 'admin123', role: 'Admin' },
-  { email: 'radiologist@medvision.ai', password: 'rad123', role: 'Radiologist' },
-  { email: 'doctor@medvision.ai', password: 'doc123', role: 'Doctor' },
-  { email: 'researcher@medvision.ai', password: 'res123', role: 'Researcher' },
-  { email: 'student@medvision.ai', password: 'stu123', role: 'Student' },
-];
-
 export const Settings: React.FC = () => {
-  const { theme, setTheme, pushNotification, session, login, logout, user } = useApp();
-  const [email, setEmail] = useState('radiologist@medvision.ai');
-  const [password, setPassword] = useState('');
-  const [authBusy, setAuthBusy] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
+  const { theme, setTheme, pushNotification, confidenceThreshold, setConfidenceThreshold } = useApp();
   const [notifToggle, setNotifToggle] = useState(true);
   const [emailToggle, setEmailToggle] = useState(false);
   const [soundToggle, setSoundToggle] = useState(true);
@@ -150,6 +138,37 @@ export const Settings: React.FC = () => {
             </select>
           </label>
         </div>
+        {/* Configurable AI confidence threshold */}
+        <div className="mt-4 rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 p-4">
+          <div className="flex items-start justify-between gap-4 flex-wrap">
+            <div className="min-w-0">
+              <p className="text-xs font-bold text-slate-800 dark:text-slate-100">Minimum AI Confidence Threshold</p>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 leading-relaxed">
+                Predictions below this confidence are flagged as <strong>low confidence</strong> and are never presented as a
+                definitive diagnosis. Warning: values above 90% will reject many real-world borderline scans.
+              </p>
+            </div>
+            <span className="shrink-0 font-mono font-black text-sm text-primary-600 dark:text-primary-400 bg-primary-500/10 border border-primary-500/30 rounded-lg px-3 py-1.5">
+              {Math.round(confidenceThreshold * 100)}%
+            </span>
+          </div>
+          <input
+            type="range"
+            min="50"
+            max="95"
+            step="5"
+            value={Math.round(confidenceThreshold * 100)}
+            onChange={(e) => setConfidenceThreshold(Number(e.target.value) / 100)}
+            className="w-full mt-3 accent-indigo-600 cursor-pointer"
+            aria-label="Minimum AI confidence threshold"
+          />
+          <div className="flex justify-between text-[10px] font-mono text-slate-400 mt-1">
+            <span>50% · permissive</span>
+            <span>75% · recommended</span>
+            <span>95% · strict</span>
+          </div>
+        </div>
+
         <div className="mt-3">
           <ToggleRow
             label="Auto-deploy on successful training"
@@ -216,130 +235,40 @@ export const Settings: React.FC = () => {
             </label>
             <div className="flex items-end">
               <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-400 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2.5 w-full bg-slate-50 dark:bg-slate-800/60">
-                <ShieldCheck className="w-4 h-4 text-emerald-500" />
-                HIPAA & GDPR compliant session (demo)
+                <Globe className="w-4 h-4 text-sky-500" />
+                Public research mode — no accounts, no PHI stored
               </span>
             </div>
           </div>
         </div>
       </GlassCard>
 
-      {/* Security & Session */}
+      {/* Public Research Mode */}
       <GlassCard>
-        <SectionHeader icon={<KeyRound className="w-4 h-4 text-emerald-500" />} title="Security & Session" subtitle="JWT-authenticated demo accounts with role-based access" />
-        {session ? (
-          <div className="mt-4">
-            <div className="flex items-center justify-between gap-4 flex-wrap rounded-2xl border border-emerald-500/25 bg-emerald-500/5 p-4">
-              <div className="flex items-center gap-3">
-                <span className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white font-black flex items-center justify-center">
-                  {session.user.name.split(' ').map((w) => w[0]).slice(0, 2).join('').toUpperCase()}
-                </span>
-                <div>
-                  <p className="text-xs font-bold text-slate-800 dark:text-slate-100">{session.user.name}</p>
-                  <p className="text-[11px] text-slate-500 dark:text-slate-400">{session.user.email} · <span className="font-bold text-emerald-600 dark:text-emerald-400">{session.user.role}</span></p>
-                  <p className="text-[10px] font-mono text-slate-400 mt-1 max-w-[240px] truncate" title={session.token}>
-                    JWT {session.token.slice(0, 32)}…
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => {
-                  logout();
-                  pushNotification({ kind: 'info', title: 'Session ended', body: 'You have been signed out. The demo role switcher remains active.' });
-                }}
-                className="inline-flex items-center gap-1.5 text-xs font-bold px-3.5 py-2 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 transition-colors cursor-pointer"
-              >
-                <LogOut className="w-3.5 h-3.5" /> Sign Out
-              </button>
-            </div>
-            <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-3 flex items-center gap-1.5">
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
-              Authenticated session · token persisted for 8h · role checks enforced via <code className="font-mono">can()</code>
+        <SectionHeader icon={<Globe className="w-4 h-4 text-sky-500" />} title="Public Research Mode" subtitle="MedVision AI requires no login, accounts, or roles" />
+        <div className="mt-4 space-y-3">
+          <div className="flex items-start gap-3 rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 p-4 text-[11px] leading-relaxed text-slate-600 dark:text-slate-300">
+            <FlaskConical className="w-4 h-4 text-fuchsia-500 shrink-0 mt-0.5" />
+            <p>
+              The application opens directly into the workspace — there is <strong>no login, logout, user account,
+              password, JWT, session, or role</strong>. All access is <strong>anonymous public access</strong>.
+              This is an AI-assisted medical imaging <strong>research &amp; education</strong> platform, not a
+              substitute for professional medical diagnosis.
             </p>
           </div>
-        ) : (
-          <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-5">
-            <div className="space-y-3">
-              <label className="block space-y-1.5">
-                <span className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">Hospital Email</span>
-                <input
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="you@medvision.ai"
-                  className="w-full bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-primary-400/50"
-                />
-              </label>
-              <label className="block space-y-1.5">
-                <span className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">Password</span>
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      (document.getElementById('settings-signin') as HTMLButtonElement)?.click();
-                    }
-                  }}
-                  placeholder="••••••••"
-                  className="w-full bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-primary-400/50"
-                />
-              </label>
-              {authError && (
-                <p className="text-[11px] font-semibold text-rose-500 bg-rose-500/10 border border-rose-500/25 rounded-lg px-3 py-2">{authError}</p>
-              )}
-              <button
-                id="settings-signin"
-                disabled={authBusy || !email || !password}
-                onClick={async () => {
-                  setAuthBusy(true);
-                  setAuthError(null);
-                  try {
-                    const s = await login(email, password);
-                    pushNotification({ kind: 'success', title: `Welcome, ${s.user.name.split(' ')[0]}`, body: `Signed in as ${s.user.role}. Role-based UI is now active.` });
-                    setPassword('');
-                  } catch {
-                    setAuthError('Invalid email or password. Try one of the demo accounts →');
-                  } finally {
-                    setAuthBusy(false);
-                  }
-                }}
-                className="w-full inline-flex items-center justify-center gap-1.5 text-xs font-bold px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white transition-colors cursor-pointer disabled:opacity-50"
-              >
-                {authBusy ? 'Authenticating…' : (
-                  <><LogIn className="w-3.5 h-3.5" /> Sign In (JWT)</>
-                )}
-              </button>
-            </div>
-            <div>
-              <p className="text-[11px] font-bold text-slate-600 dark:text-slate-300 mb-2 flex items-center gap-1.5">
-                <Lock className="w-3.5 h-3.5 text-slate-400" /> Demo Accounts — click to autofill
-              </p>
-              <div className="space-y-1.5">
-                {DEMO_ACCOUNTS.map((acc) => (
-                  <button
-                    key={acc.email}
-                    onClick={() => {
-                      setEmail(acc.email);
-                      setPassword(acc.password);
-                    }}
-                    className="w-full flex items-center justify-between gap-2 text-left text-[11px] font-mono px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 hover:border-primary-400 transition-colors cursor-pointer"
-                  >
-                    <span className="text-slate-700 dark:text-slate-200">{acc.email}</span>
-                    <span className="text-[9px] font-bold text-slate-400">{acc.role}</span>
-                  </button>
-                ))}
-              </div>
-              <p className="text-[10px] text-slate-400 mt-2.5">
-                Demo session (currently <strong>{user.name}</strong> · {user.role}). Authenticated sessions override the role switcher until sign-out.
-              </p>
-            </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[10px] font-mono text-slate-400">
+            {['No authentication', 'No PHI stored', 'All patient data synthetic'].map((t) => (
+              <span key={t} className="inline-flex items-center gap-1.5 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2">
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" /> {t}
+              </span>
+            ))}
           </div>
-        )}
+        </div>
       </GlassCard>
 
       {/* About */}
       <GlassCard>
-        <SectionHeader icon={<Sparkles className="w-4 h-4 text-fuchsia-500" />} title="About MedVision AI" subtitle="Enterprise Edition 2.5.0" />
+        <SectionHeader icon={<Sparkles className="w-4 h-4 text-fuchsia-500" />} title="About MedVision AI" subtitle="Enterprise Edition 2.7.0 · Public Research Mode" />
         <div className="flex items-center gap-3 mt-4 text-[11px] text-slate-500 dark:text-slate-400">
           <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-600 to-violet-600 text-white font-black flex items-center justify-center shadow-lg shadow-indigo-500/30">
             M

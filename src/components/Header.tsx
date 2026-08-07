@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import { Menu, Sun, Moon, Bell, Search, ShieldAlert, Activity } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { NotificationsPanel } from './NotificationsPanel';
-import { RoleSwitcher } from './RoleSwitcher';
 import { cn } from '../utils/cn';
 
 export type NavTab =
@@ -82,7 +81,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, onToggl
           </span>
         </div>
         <span className="hidden md:inline-block text-[9px] bg-white/15 px-1.5 py-0.5 rounded border border-white/25 font-mono shrink-0">
-          v2.5.0 Enterprise
+          v2.7.0 · PUBLIC RESEARCH MODE
         </span>
       </div>
 
@@ -196,8 +195,14 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, onToggl
 
             <span className="hidden sm:block w-px h-6 bg-slate-200 dark:bg-slate-700 mx-0.5" />
 
-            {/* Role switcher / avatar */}
-            <RoleSwitcher />
+            {/* Public research mode badge — no accounts, no login */}
+            <span
+              className="hidden lg:inline-flex items-center gap-1.5 text-[10px] font-mono font-bold px-2.5 py-1.5 rounded-full border border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400"
+              title="MedVision AI is a public research & education platform. No login, accounts, or roles are required."
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-slate-400" />
+              PUBLIC MODE
+            </span>
           </div>
         </div>
 

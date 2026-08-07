@@ -2,12 +2,13 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Bot, Send, Mic, MicOff, Volume2, VolumeX, Sparkles, X, ChevronRight,
   Maximize2, Minimize2, Copy, Check, ThumbsUp, ThumbsDown, Download,
-  Pin, RefreshCw, BarChart2, ShieldAlert, Cpu, HelpCircle, FileText,
-  MessageSquare, Stethoscope, Layers, ExternalLink, Activity, GitCompare
+  Pin, BarChart2, ShieldAlert, FileText, Stethoscope, Layers, Activity,
+  GitCompare, GripVertical, Lock,
 } from 'lucide-react';
 import { PredictionResult } from '../types';
 import { ChatChartWidget, ChartWidgetType } from './ChatChartWidget';
 import { MEDICAL_KNOWLEDGE_BASE, MEDICAL_GLOSSARY } from '../data/medicalKnowledge';
+import { cn } from '../utils/cn';
 
 interface Message {
   id: string;
@@ -26,13 +27,22 @@ interface MedicalCopilotProps {
   onExportPdf?: () => void;
   isOpen?: boolean;
   onToggleOpen?: () => void;
+  /** Reports/PDF/DOCX/QR export unlocked only after a validated analysis. */
+  canExport?: boolean;
 }
+
+const MIN_W = 320;
+const MIN_H = 400;
+const DEFAULT_W = 380;
+const DEFAULT_H = 560;
+const EXPANDED_W = 560;
 
 export const MedicalCopilot: React.FC<MedicalCopilotProps> = ({
   predictionResult,
   onExportPdf,
-  isOpen = true,
+  isOpen = false,
   onToggleOpen,
+  canExport = true,
 }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputQuery, setInputQuery] = useState('');
@@ -43,6 +53,20 @@ export const MedicalCopilot: React.FC<MedicalCopilotProps> = ({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [provider, setProvider] = useState<'gemini' | 'openai' | 'claude' | 'ollama'>('gemini');
   const [lastPredictionId, setLastPredictionId] = useState<string | null>(null);
+
+  // Floating-window geometry
+  const [size, setSize] = useState({ w: DEFAULT_W, h: DEFAULT_H });
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null); // null = anchored bottom-right
+  const [closing, setClosing] = useState(false);
+  const dragRef = useRef<{
+    mode: 'move' | 'resize';
+    startX: number;
+    startY: number;
+    baseX: number;
+    baseY: number;
+    baseW: number;
+    baseH: number;
+  } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -70,28 +94,15 @@ export const MedicalCopilot: React.FC<MedicalCopilotProps> = ({
         id: `msg_welcome_${Date.now()}`,
         role: 'assistant',
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        content: `👋 **Hello! I analyzed your uploaded chest X-ray.**
-
-The AI model predicts **${topDiag}** with **${confStr}% confidence** (Severity: **${severity}**).
-
-I can explain:
-• **What ${topDiag} is**
-• **Why the model predicted it**
-• **What the highlighted Grad-CAM heatmap means**
-• **Common symptoms & risk factors**
-• **Treatment overview**
-• **Similar diseases & differential diagnosis**
-• **Model limitations & AI confidence calibration**
-
-Ask me anything or click a suggested button below!`,
+        content: `👋 **Hello! I analyzed your uploaded chest X-ray.**\n\nThe AI model predicts **${topDiag}** with **${confStr}% confidence** (Severity: **${severity}**).\n\nI can explain:\n• **What ${topDiag} is**\n• **Why the model predicted it**\n• **What the highlighted Grad-CAM heatmap means**\n• **Common symptoms & risk factors**\n• **Treatment overview**\n• **Similar diseases & differential diagnosis**\n• **Model limitations & AI confidence calibration**\n\nAsk me anything or click a suggested button below!`,
         suggestedQuestions: [
           `Explain ${topDiag}`,
-          `Explain Heatmap`,
-          `Explain Confidence`,
-          `Compare Diseases`,
-          `Treatment Overview`,
-          `Show Interactive Charts`,
-          `Explain AI (Grad-CAM)`,
+          'Explain Heatmap',
+          'Explain Confidence',
+          'Compare Diseases',
+          'Treatment Overview',
+          'Show Interactive Charts',
+          'Explain AI (Grad-CAM)',
         ],
       };
 
@@ -284,12 +295,89 @@ Ask me anything or click a suggested button below!`,
     URL.revokeObjectURL(url);
   };
 
+  /* ---------------- Floating window drag / resize ---------------- */
+
+  const handleClose = () => {
+    if (!onToggleOpen || closing) return;
+    setClosing(true);
+    window.setTimeout(() => {
+      setClosing(false);
+      onToggleOpen();
+    }, 200);
+  };
+
+  const onHeaderPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).closest('button, select, input, textarea')) return;
+    e.preventDefault();
+    const baseX = pos?.x ?? Math.max(8, window.innerWidth - size.w - 24);
+    const baseY = pos?.y ?? Math.max(8, window.innerHeight - size.h - 24);
+    dragRef.current = { mode: 'move', startX: e.clientX, startY: e.clientY, baseX, baseY, baseW: size.w, baseH: size.h };
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      /* non-real pointer (synthetic/test) — tracking still works via move events */
+    }
+  };
+
+  const onHeaderPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const d = dragRef.current;
+    if (!d || d.mode !== 'move') return;
+    const nx = Math.min(Math.max(8, d.baseX + (e.clientX - d.startX)), Math.max(8, window.innerWidth - d.baseW - 8));
+    const ny = Math.min(Math.max(8, d.baseY + (e.clientY - d.startY)), Math.max(8, window.innerHeight - d.baseH - 8));
+    setPos({ x: nx, y: ny });
+  };
+
+  const onResizePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const baseX = pos?.x ?? Math.max(8, window.innerWidth - size.w - 24);
+    const baseY = pos?.y ?? Math.max(8, window.innerHeight - size.h - 24);
+    dragRef.current = { mode: 'resize', startX: e.clientX, startY: e.clientY, baseX, baseY, baseW: size.w, baseH: size.h };
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      /* non-real pointer (synthetic/test) — tracking still works via move events */
+    }
+  };
+
+  const onResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const d = dragRef.current;
+    if (!d || d.mode !== 'resize') return;
+    // Fixed edge: the left/top position when dragged, or the 24px right/bottom
+    // anchor offsets when the panel hasn't been moved yet.
+    const maxW = pos
+      ? Math.max(MIN_W, window.innerWidth - pos.x - 8)
+      : Math.max(MIN_W, window.innerWidth - 24 - 8);
+    const maxH = pos
+      ? Math.max(MIN_H, window.innerHeight - pos.y - 8)
+      : Math.max(MIN_H, window.innerHeight - 24 - 8);
+    const w = Math.min(Math.max(MIN_W, d.baseW + (e.clientX - d.startX)), maxW);
+    const h = Math.min(Math.max(MIN_H, d.baseH + (e.clientY - d.startY)), maxH);
+    setSize({ w, h });
+    setIsExpanded(false);
+  };
+
+  const endDrag = () => {
+    dragRef.current = null;
+  };
+
+  const toggleExpand = () => {
+    setIsExpanded((prev) => {
+      const next = !prev;
+      setSize((s) => ({ ...s, w: next ? EXPANDED_W : DEFAULT_W }));
+      return next;
+    });
+  };
+
+  /* ---------------- Closed state: floating action button ---------------- */
+
   if (!isOpen) {
     return (
       <button
         onClick={onToggleOpen}
-        className="fixed bottom-6 right-6 z-50 bg-indigo-600 hover:bg-indigo-500 text-white p-3.5 rounded-full shadow-2xl flex items-center gap-2 font-semibold transition-all hover:scale-105 active:scale-95 group border border-indigo-400/40 cursor-pointer"
+        className="fixed bottom-6 right-6 z-50 bg-indigo-600 hover:bg-indigo-500 text-white p-3.5 rounded-full shadow-2xl flex items-center gap-2 font-semibold transition-all hover:scale-105 active:scale-95 group border border-indigo-400/40 cursor-pointer animate-copilot-in"
         title="Open AI Medical Copilot"
+        aria-label="Open AI Medical Copilot"
       >
         <Bot className="w-5 h-5 text-white animate-bounce" />
         <span className="text-xs font-bold tracking-wide hidden sm:inline">AI Copilot</span>
@@ -298,36 +386,57 @@ Ask me anything or click a suggested button below!`,
     );
   }
 
+  /* ---------------- Open state: floating window ---------------- */
+
   return (
-    <aside
-      className={`fixed top-14 right-0 bottom-0 z-40 bg-slate-900 border-l border-slate-800 flex flex-col shadow-2xl transition-all duration-300 ${
-        isExpanded ? 'w-full md:w-[620px]' : 'w-full md:w-[380px] lg:w-[420px]'
-      }`}
+    <div
+      className={cn(
+        'fixed z-50 flex flex-col overflow-hidden rounded-2xl shadow-2xl select-none',
+        'bg-slate-900/95 backdrop-blur-xl border border-slate-700/80',
+        closing ? 'animate-copilot-out' : 'animate-copilot-in'
+      )}
+      style={{
+        width: size.w,
+        height: size.h,
+        maxWidth: 'calc(100vw - 1.5rem)',
+        maxHeight: 'calc(100vh - 3rem)',
+        ...(pos ? { left: pos.x, top: pos.y } : { right: 24, bottom: 24 }),
+      }}
+      role="dialog"
+      aria-label="AI Medical Copilot"
     >
-      {/* Copilot Header */}
-      <div className="px-3 py-2 bg-slate-950 border-b border-slate-800 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2">
-          <div className="w-7 h-7 bg-gradient-to-tr from-indigo-600 to-purple-600 rounded-lg flex items-center justify-center text-white shadow-xs">
+      {/* Copilot Header (drag handle) */}
+      <div
+        className="px-3 py-2 bg-slate-950 border-b border-slate-800 flex items-center justify-between shrink-0 cursor-grab active:cursor-grabbing touch-none"
+        onPointerDown={onHeaderPointerDown}
+        onPointerMove={onHeaderPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        title="Drag to move"
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <GripVertical className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+          <div className="w-7 h-7 bg-gradient-to-tr from-indigo-600 to-purple-600 rounded-lg flex items-center justify-center text-white shadow-xs shrink-0">
             <Bot className="w-4 h-4" />
           </div>
-          <div>
+          <div className="min-w-0">
             <div className="flex items-center gap-1.5">
-              <h2 className="text-xs font-bold text-white tracking-tight">AI Medical Copilot</h2>
+              <h2 className="text-xs font-bold text-white tracking-tight whitespace-nowrap">AI Medical Copilot</h2>
               <span className="bg-indigo-950 text-indigo-300 text-[9px] px-1.5 py-0.2 rounded border border-indigo-800 font-mono">
                 RAG + Gemini
               </span>
             </div>
-            <p className="text-[10px] text-slate-400">Context-Aware Clinical Assistant</p>
+            <p className="text-[10px] text-slate-400 truncate">Context-Aware Clinical Assistant</p>
           </div>
         </div>
 
         {/* Action Controls */}
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 shrink-0">
           {/* Provider Selector */}
           <select
             value={provider}
             onChange={(e: any) => setProvider(e.target.value)}
-            className="bg-slate-900 text-slate-300 text-[10px] px-1.5 py-0.5 rounded border border-slate-700 font-mono cursor-pointer hover:border-slate-600 focus:outline-hidden"
+            className="bg-slate-900 text-slate-300 text-[10px] px-1.5 py-0.5 rounded border border-slate-700 font-mono cursor-pointer hover:border-slate-600 focus:outline-hidden max-w-[90px]"
           >
             <option value="gemini">Gemini 3.6</option>
             <option value="openai">OpenAI (Adapter)</option>
@@ -348,7 +457,7 @@ Ask me anything or click a suggested button below!`,
 
           {/* Expand/Contract Toggle */}
           <button
-            onClick={() => setIsExpanded(!isExpanded)}
+            onClick={toggleExpand}
             className="p-1.5 text-slate-400 hover:text-slate-200 rounded cursor-pointer hidden md:block"
             title={isExpanded ? 'Collapse Panel Width' : 'Expand Panel Width'}
           >
@@ -367,7 +476,7 @@ Ask me anything or click a suggested button below!`,
           {/* Close Panel */}
           {onToggleOpen && (
             <button
-              onClick={onToggleOpen}
+              onClick={handleClose}
               className="p-1.5 text-slate-400 hover:text-red-400 rounded cursor-pointer ml-1"
               title="Close Panel"
             >
@@ -571,13 +680,23 @@ Ask me anything or click a suggested button below!`,
             <GitCompare className="w-3 h-3 text-pink-400" />
             <span>Compare</span>
           </button>
-          {onExportPdf && (
+          {onExportPdf && canExport && (
             <button
               onClick={onExportPdf}
               className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 whitespace-nowrap cursor-pointer flex items-center gap-1"
             >
               <Download className="w-3 h-3 text-blue-400" />
               <span>Download PDF</span>
+            </button>
+          )}
+          {onExportPdf && !canExport && (
+            <button
+              disabled
+              title="Run a validated analysis to unlock report export"
+              className="px-2 py-1 bg-slate-800/50 text-slate-500 rounded border border-slate-700/60 whitespace-nowrap flex items-center gap-1 cursor-not-allowed"
+            >
+              <Lock className="w-3 h-3" />
+              <span>PDF Locked</span>
             </button>
           )}
         </div>
@@ -610,7 +729,7 @@ Ask me anything or click a suggested button below!`,
             value={inputQuery}
             onChange={(e) => setInputQuery(e.target.value)}
             placeholder="Ask AI Copilot about X-ray, Grad-CAM, symptoms..."
-            className="flex-1 bg-slate-900 text-slate-100 placeholder-slate-500 text-xs px-3 py-2 rounded-lg border border-slate-800 focus:outline-hidden focus:border-indigo-500 transition-colors"
+            className="flex-1 bg-slate-900 text-slate-100 placeholder-slate-500 text-xs px-3 py-2 rounded-lg border border-slate-800 focus:outline-hidden focus:border-indigo-500 transition-colors min-w-0"
           />
 
           {/* Send Button */}
@@ -623,6 +742,21 @@ Ask me anything or click a suggested button below!`,
           </button>
         </form>
       </div>
-    </aside>
+
+      {/* Resize handle (bottom-right) */}
+      <div
+        className="absolute bottom-0 right-0 w-6 h-6 cursor-nwse-resize touch-none flex items-end justify-end pr-0.5 pb-0.5"
+        onPointerDown={onResizePointerDown}
+        onPointerMove={onResizePointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        title="Drag to resize"
+      >
+        <svg width="10" height="10" viewBox="0 0 10 10" className="text-slate-500">
+          <path d="M10 0 L10 10 L0 10 Z" fill="currentColor" opacity="0.35" />
+          <path d="M10 4 L10 10 L4 10 Z" fill="currentColor" opacity="0.6" />
+        </svg>
+      </div>
+    </div>
   );
 };

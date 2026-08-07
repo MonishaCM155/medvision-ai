@@ -65,6 +65,28 @@ export interface PredictionResult {
     meanIntensity: number;
     contrastRatio: number;
   };
+  /** AI safety pipeline metadata (additive) */
+  calibration?: CalibrationInfo;
+  uncertainty?: UncertaintyInfo;
+  typeCheck?: ImageTypeResult;
+  quality?: { score: number; threshold?: number };
+  ood?: { score: number; verdict: 'in' | 'borderline' | 'out'; method: string } | null;
+  /** Authoritative provenance — who validated and whether inference actually ran. */
+  workflow?: 'upload' | 'sample';
+  validationSource?: 'fastapi' | 'sample-demo' | 'demo' | string;
+  predictionGenerated?: boolean;
+  reportAllowed?: boolean;
+  engine?: {
+    engineMode?: string;
+    source?: string;
+    modelName?: string;
+    modelVersion?: string;
+    weightsLoaded?: boolean;
+    predictionSource?: string;
+    device?: string;
+    proxied?: boolean;
+    reason?: string;
+  };
 }
 
 export interface ModelMetadata {
@@ -109,12 +131,9 @@ export interface SystemStats {
 /* Enterprise additions (additive only)                                 */
 /* ------------------------------------------------------------------ */
 
-export type UserRole = 'Admin' | 'Radiologist' | 'Doctor' | 'Researcher' | 'Student';
-
 export interface SessionUser {
   name: string;
   initials: string;
-  role: UserRole;
   department: string;
   lastActive: string;
 }
@@ -217,6 +236,9 @@ export interface HubModel {
   description: string;
   bestFor: string;
   deployed: boolean;
+  /** Data provenance: published benchmark vs demo estimate — no fake metrics. */
+  source: 'published' | 'estimated' | 'synthetic';
+  reference?: string;
 }
 
 export interface DatasetInfo {
@@ -275,14 +297,53 @@ export interface EngineStatus {
   note?: string;
 }
 
-export interface AuthUser {
-  id?: string;
-  name: string;
-  email?: string;
-  role: UserRole;
+export interface CalibrationInfo {
+  rawTopConfidence: number;
+  calibratedTopConfidence: number;
+  temperature: number;
+  applied: boolean;
+  method: string;
 }
 
-export interface AuthSession {
-  token: string;
-  user: AuthUser;
+export interface UncertaintyInfo {
+  score: number;
+  level: 'low' | 'moderate' | 'high';
+  method: string;
+  samples?: number;
+}
+
+export interface ImageTypeResult {
+  predicted: string;
+  confidences: Record<string, number>;
+  method: string;
+}
+
+export interface SafetyReport {
+  passed: boolean;
+  source?: string;
+  proxied?: boolean;
+  type?: ImageTypeResult;
+  quality?: { score: number; threshold?: number };
+  ood?: { score: number; verdict: 'in' | 'borderline' | 'out'; method: string } | null;
+  calibration?: { temperature?: number };
+  note?: string;
+}
+
+export interface MonitoringSnapshot {
+  service: string;
+  version: string;
+  status: string;
+  uptimeSec: number;
+  requests: number;
+  requestsPerMinute: number;
+  errors: number;
+  rejectedImages: number;
+  predictions: number;
+  avgInferenceMs: number | null;
+  engine: { status: 'ready' | 'offline'; source: string; device: string };
+  modelVersion: string;
+  storage: string;
+  memory: { rssMb: number; heapUsedMb: number; heapTotalMb: number };
+  cpu: { user: number; system: number };
+  timestamp: string;
 }

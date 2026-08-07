@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Search, LayoutDashboard, UploadCloud, Layers, UserCheck, Users, BookOpen, History,
   Cpu, GraduationCap, Database, BarChart3, Activity, FileText, Settings, Bot, Sun, Moon,
-  ScanLine, CornerDownLeft, Command, UserRound,
+  ScanLine, CornerDownLeft, Command,
 } from 'lucide-react';
 import { NavTab } from './Header';
 import { useApp } from '../contexts/AppContext';
@@ -161,15 +161,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ onNavigate, onNe
         group: 'Actions',
         keywords: 'theme dark light appearance',
         execute: toggleTheme,
-      },
-      {
-        id: 'act-profile',
-        label: 'Switch Role',
-        hint: 'Admin · Radiologist · Doctor · Researcher · Student',
-        icon: <UserRound className="w-4 h-4" />,
-        group: 'Actions',
-        keywords: 'role profile user account',
-        execute: () => onNavigate('settings'),
       },
     ];
 
