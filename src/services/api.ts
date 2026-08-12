@@ -63,6 +63,23 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  /**
+   * Genuine similar-case retrieval: DenseNet-121 feature embeddings + cosine
+   * similarity (FastAPI engine). 503 when the engine is offline — callers
+   * fall back to clearly-labelled demo similarities.
+   */
+  getSimilarCases: (queryImage: string, references: { id: string; title: string; label?: string; imageData: string }[]): Promise<{
+    method: string;
+    embedding: string;
+    device?: string;
+    disclaimer: string;
+    cases: { case_id: string; title?: string; label?: string; similarity: number }[];
+  }> =>
+    fetchJson('/api/similar-cases', {
+      method: 'POST',
+      body: JSON.stringify({ queryImage, references }),
+    }),
+
   /** Live operational telemetry (uptime, memory, engine, rejections…). */
   getMonitoring: (): Promise<MonitoringSnapshot> =>
     fetchJson<MonitoringSnapshot>('/api/monitoring').catch(() => ({

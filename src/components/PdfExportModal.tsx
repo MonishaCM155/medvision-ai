@@ -50,7 +50,7 @@ export const PdfExportModal: React.FC<PdfExportModalProps> = ({ result, onClose 
     <p style="margin:0; color:#64748b;">Report ID: ${result.report.patientId} | Date: ${result.report.studyDate} | Model: ${result.modelUsed}</p>
   </div>
   <table style="width:100%; border-collapse:collapse; margin:12px 0; font-size:10pt;">
-    <tr><td><b>PATIENT ID:</b> ${result.report.patientId}</td><td><b>AGE/SEX:</b> ${result.report.patientAge || 52} / ${result.report.patientSex || 'M'}</td></tr>
+    <tr><td><b>PATIENT ID:</b> ${result.report.patientId}</td><td><b>AGE/SEX:</b> ${result.report.patientAge ?? 'n/a'} / ${result.report.patientSex ?? 'n/a'}</td></tr>
     <tr><td><b>SEVERITY:</b> ${result.severity.toUpperCase()} (${result.severityScore}/100)</td><td><b>TOP FINDING:</b> ${result.topDiagnosis} (${(result.topConfidence * 100).toFixed(0)}%)</td></tr>
   </table>
   <h3 style="text-transform:uppercase; font-size:10pt;">Multi-Disease Probabilities</h3>
@@ -221,7 +221,7 @@ export const PdfExportModal: React.FC<PdfExportModalProps> = ({ result, onClose 
               </div>
               <div>
                 <span className="text-slate-500 block text-[9px]">AGE / SEX</span>
-                <span>{result.report.patientAge || 52} Y.O. / {result.report.patientSex || 'M'}</span>
+                <span>{result.report.patientAge != null ? `${result.report.patientAge} Y.O.` : 'Age n/a'} / {result.report.patientSex || 'Sex n/a'}</span>
               </div>
               <div>
                 <span className="text-slate-500 block text-[9px]">SEVERITY</span>

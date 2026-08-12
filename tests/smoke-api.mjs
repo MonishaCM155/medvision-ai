@@ -73,14 +73,15 @@ const noBytes = await post('/api/predict', { imageName: 'covid_sample.png' });
 ok(noBytes.status === 422 && noBytes.body.code === 'INVALID_IMAGE' && noBytes.body.predictionGenerated === false, 'upload without image bytes is rejected — no prediction', String(noBytes.status));
 
 // 8. Adversarial: fabricated client validation must NEVER authorize inference.
-// The engine is offline in this run, so the server returns 503 — it must not
-// fall back to a demo disease prediction because the client claims pass.
+// Engine offline → 503; engine online → the authoritative server-side gate
+// still refuses the non-CXR payload with 422. Either way: NO prediction, no
+// demo fallback, regardless of what the client claims.
 const attack = await post('/api/predict', {
   imageName: 'photo.jpg',
   imageData: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   validation: { passed: true, valid: true, validated: true, safe: true, quality: 100, ood: false, imageType: 'chest-xray', confidence: 0.99 },
 });
-ok(attack.status === 503 && attack.body.code === 'ML_ENGINE_UNAVAILABLE' && attack.body.predictionGenerated === false, 'fabricated client validation cannot authorize inference (503, no prediction)');
+ok((attack.status === 503 && attack.body.code === 'ML_ENGINE_UNAVAILABLE' || attack.status === 422) && attack.body.predictionGenerated === false, 'fabricated client validation cannot authorize inference (503/422, no prediction)');
 
 // 9. Known bundled sample study → explicit, clearly-labelled demo workflow
 const sample = await post('/api/predict', { imageName: 'chest_xray_covid_bilateral.dcm' });
@@ -92,7 +93,7 @@ ok(!!sample.body.originalImageUrl || sample.body.engine?.proxied !== undefined, 
 // 9b. Adversarial: spoofed sample filename + arbitrary bytes must NOT be treated
 // as a sample — byte-verification sends it down the user-upload path (503 offline)
 const spoof = await post('/api/predict', { imageName: 'chest_xray_covid_bilateral.dcm', imageData: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=' });
-ok(spoof.status === 503 && spoof.body.predictionGenerated === false, 'spoofed sample filename + wrong bytes → upload path, no demo diagnosis', String(spoof.status));
+ok((spoof.status === 503 || spoof.status === 422) && spoof.body.predictionGenerated === false, 'spoofed sample filename + wrong bytes → upload path, no demo diagnosis', String(spoof.status));
 
 // 10. Sample normal → No Finding / Low
 const sampleNormal = await post('/api/predict', { imageName: 'chest_xray_normal_screening.dcm' });
@@ -121,9 +122,15 @@ ok(datasets.status === 200 && datasets.body.length >= 5, 'GET /api/datasets retu
 const training = await get('/api/training/runs');
 ok(training.status === 200 && Array.isArray(training.body), 'GET /api/training/runs returns runs');
 
-// 11. Batch — authoritative mode requires the engine (offline → 503, no fabrication)
+// 11. Batch — authoritative mode never fabricates. Engine offline → 503;
+// engine online with no image bytes → every file reports an explicit error.
 const batchStrict = await post('/api/batch-predict', { files: [{ name: 'a.png', size: 100 }, { name: 'b.png', size: 200 }] });
-ok(batchStrict.status === 503 && batchStrict.body.code === 'ML_ENGINE_UNAVAILABLE', 'authoritative batch without engine → 503, no fabricated results');
+const batchOk =
+  (batchStrict.status === 503 && batchStrict.body.code === 'ML_ENGINE_UNAVAILABLE') ||
+  (batchStrict.status === 200 && Array.isArray(batchStrict.body.batchResults) &&
+    batchStrict.body.batchResults.length === 2 &&
+    batchStrict.body.batchResults.every((r) => r.status === 'error'));
+ok(batchOk, 'authoritative batch never fabricates (503 offline, or per-file errors online)', String(batchStrict.status));
 
 // 12. Batch — explicit demo mode is allowed and flagged
 const batchDemo = await post('/api/batch-predict', { files: [{ name: 'a.png', size: 100 }, { name: 'b.png', size: 200 }], mode: 'demo' });

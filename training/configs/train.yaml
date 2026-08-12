@@ -1,0 +1,59 @@
+# ===========================================================================
+# MedVision AI — training configuration (default)
+#
+# Usage:
+#   python training/train.py --config training/configs/train.yaml
+#   python training/train.py --config ... --epochs 20 --batch_size 32   # CLI overrides
+#   python training/train.py --config ... --synthetic-sanity            # validate the
+#       pipeline end-to-end on a tiny synthetic dataset (no real data needed)
+#
+# The inference engine (backend/app/main.py) scans training/checkpoints/*.pt
+# and switches to full real inference when it finds a fine-tuned 10/14-class
+# head. NOTE: sanity checkpoints are written to training/checkpoints/sanity/
+# so they are never picked up as real weights.
+# ===========================================================================
+
+experiment:
+  name: densenet121-chestxray
+  seed: 42
+
+dataset:
+  # NIH ChestX-ray14 layout: images_dir contains the PNG images; labels_csv is
+  # Data_Entry_2017.csv with columns Image Index / Finding Labels / Patient ID.
+  # (Patient-level split requires the Patient ID column.)
+  images_dir: ./datasets/nih_chestxray/images
+  labels_csv: ./datasets/nih_chestxray/Data_Entry_2017.csv
+  train_frac: 0.8
+  val_frac: 0.1
+  input_size: 224
+  # NIH uses synonyms for some of the model labels — mapped here. NIH does not
+  # contain COVID-19 or Tuberculosis cases; those classes remain all-zero on
+  # NIH-only training (documented limitation, not a claim of coverage).
+  label_alias:
+    Effusion: Pleural Effusion
+    Infiltration: Lung Opacity
+    Consolidation: Lung Opacity
+
+model:
+  architecture: densenet121        # the only supported backbone
+  pretrained: true                 # ImageNet-initialized backbone
+  num_classes: 10                  # must match the engine's fine-tuned head
+
+training:
+  epochs: 50
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.0001
+  optimizer: adam                  # adam | sgd
+  momentum: 0.9                    # sgd only
+  scheduler: cosine                # cosine | step | none
+  step_size: 15                    # step scheduler only
+  gamma: 0.1                       # step scheduler only
+  amp: true                        # mixed precision (CUDA only; ignored on CPU)
+  early_stopping_patience: 8       # on validation macro-AUROC
+  checkpoint_dir: training/checkpoints
+  resume: null                     # path to a checkpoint to resume from
+  # Multiplier on inverse-frequency class weights for BCEWithLogitsLoss.
+  # 0 disables class weighting; 1.0 = plain inverse-frequency; >1 over-weights
+  # rare positives (helps pneumonia/effusion; may destabilize). Clamped [0.1, 50].
+  pos_weight_alpha: 1.0

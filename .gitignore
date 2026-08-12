@@ -17,6 +17,13 @@ __pycache__/
 data/
 .freebuff/
 
+# Training / evaluation outputs (model weights, generated artifacts, datasets)
+artifacts/
+training/checkpoints/
+training/datasets/
+*.pt
+*.pth
+
 # Local databases
 *.db
 *.db-shm

@@ -2,9 +2,13 @@
  * MedVision AI Types
  */
 
+import type { ValidationCheck } from './utils/imageValidation';
+
 export interface DiseaseProbability {
   disease: string;
   probability: number; // 0.0 to 1.0
+  /** Decision threshold for this class (global 0.5 unless overridden). */
+  threshold?: number;
   severityContribution: number; // weight
   category: 'lung_opacity' | 'infection' | 'structural' | 'pleural' | 'normal';
   description: string;
@@ -71,6 +75,19 @@ export interface PredictionResult {
   typeCheck?: ImageTypeResult;
   quality?: { score: number; threshold?: number };
   ood?: { score: number; verdict: 'in' | 'borderline' | 'out'; method: string } | null;
+  /** Server-side per-check validation report (PASS/WARN/FAIL). */
+  validationChecks?: ValidationCheck[];
+  /** Real activation-map data URL computed by the engine (Grad-CAM / ++ / feature-activation). */
+  heatmapUrl?: string;
+  /** Explainability metadata from the engine. */
+  explainability?: {
+    method?: string;
+    targetClass?: string | null;
+    layer?: string;
+    computed?: boolean;
+    note?: string;
+  };
+  thresholdPolicy?: { default?: number; perClass?: boolean; note?: string };
   /** Authoritative provenance — who validated and whether inference actually ran. */
   workflow?: 'upload' | 'sample';
   validationSource?: 'fastapi' | 'sample-demo' | 'demo' | string;
@@ -320,6 +337,10 @@ export interface ImageTypeResult {
 
 export interface SafetyReport {
   passed: boolean;
+  /** Structured per-check validation (format/resolution/grayscale/contrast/brightness/sharpness/orientation/chest_xray). */
+  checks?: ValidationCheck[];
+  valid?: boolean;
+  quality_score?: number;
   source?: string;
   proxied?: boolean;
   type?: ImageTypeResult;

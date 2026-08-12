@@ -109,6 +109,19 @@ class PredictionResponse(BaseModel):
     typeCheck: Optional[dict] = None
     quality: Optional[dict] = None
     ood: Optional[dict] = None
+    # Real explainability + validation additions (additive, back-compatible)
+    originalImageUrl: Optional[str] = None
+    heatmapUrl: Optional[str] = None
+    heatmapOverlayUrl: Optional[str] = None
+    explainability: Optional[dict] = None
+    validationChecks: Optional[list] = None
+    thresholdPolicy: Optional[dict] = None
+    workflow: Optional[str] = None
+    validationSource: Optional[str] = None
+    predictionGenerated: Optional[bool] = None
+    reportAllowed: Optional[bool] = None
+    claheApplied: Optional[bool] = None
+    noiseRemovalApplied: Optional[bool] = None
 
 
 class PredictRequest(BaseModel):
@@ -127,6 +140,10 @@ class ValidateResponse(BaseModel):
     calibration: Optional[dict] = None
     engine: Optional[dict] = None
     message: Optional[str] = None
+    # Structured per-check validation (PASS/WARN/FAIL) — additive
+    valid: Optional[bool] = None
+    quality_score: Optional[int] = None
+    checks: Optional[list] = None
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +247,122 @@ def _quality_threshold() -> int:
         return max(0, min(100, int(os.environ.get("QUALITY_THRESHOLD", "55"))))
     except ValueError:
         return 55
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _validation_thresholds() -> dict:
+    """Configurable per-check validation thresholds (env-overridable)."""
+    return {
+        "minShortEdge": _env_int("VALIDATION_MIN_SHORT_EDGE", 256),
+        "maxColorDeviation": _env_float("VALIDATION_MAX_COLOR_DEVIATION", 18.0),
+        "minStdContrast": _env_float("VALIDATION_MIN_STD_CONTRAST", 8.0),
+        "minSharpness": _env_float("VALIDATION_MIN_SHARPNESS", 15.0),
+        "warnSharpness": _env_float("VALIDATION_WARN_SHARPNESS", 30.0),
+        "minStructureScore": _env_float("VALIDATION_MIN_STRUCTURE_SCORE", 45.0),
+        "warnStructureScore": _env_float("VALIDATION_WARN_STRUCTURE_SCORE", 60.0),
+        "minBrightness": _env_float("VALIDATION_MIN_BRIGHTNESS", 20.0),
+        "maxBrightness": _env_float("VALIDATION_MAX_BRIGHTNESS", 235.0),
+        "maxAspectRatio": _env_float("VALIDATION_MAX_ASPECT_RATIO", 1.45),
+    }
+
+
+def _validation_checks(m: Optional[dict], thr: dict) -> List[dict]:
+    """Structured per-check validation: format / resolution / grayscale /
+    contrast / brightness / sharpness / orientation / chest_xray, each with an
+    explicit PASS | WARN | FAIL status and a human-readable reason. Never
+    rejects without explaining why."""
+    if m is None:
+        return [{
+            "key": "format", "label": "Decodable image", "status": "fail",
+            "detail": "The image payload could not be decoded — re-export as PNG/JPEG/WebP and retry.",
+        }]
+    checks: List[dict] = []
+
+    def add(key, label, status, detail):
+        checks.append({"key": key, "label": label, "status": status, "detail": detail})
+
+    min_edge = min(m["width"], m["height"])
+    add("format", "File integrity & format", "pass", f"{m['width']}×{m['height']} px decodable raster")
+    if min_edge < thr["minShortEdge"]:
+        add("resolution", "Resolution", "fail",
+            f"Short edge is {min_edge}px — a diagnostic radiograph needs at least {thr['minShortEdge']}px. The upload is too small/low-resolution.")
+    else:
+        add("resolution", "Resolution", "pass", f"{m['width']}×{m['height']} px meets minimum radiograph resolution")
+    if m["colorDeviation"] > thr["maxColorDeviation"]:
+        add("grayscale", "Grayscale", "fail",
+            f"Strong color detected (mean channel gap {m['colorDeviation']:.1f}). Chest radiographs are grayscale — this looks like non-radiographic content.")
+    else:
+        add("grayscale", "Grayscale", "pass", f"Grayscale (mean channel gap {m['colorDeviation']:.1f}) — consistent with a radiograph")
+    if m["aspectRatio"] <= 0 or m["aspectRatio"] > thr["maxAspectRatio"]:
+        add("orientation", "Orientation & framing", "fail",
+            f"Aspect {m['aspectRatio']:.2f} — frontal chest X-rays are near-square or portrait. Rotate to portrait and retry.")
+    else:
+        add("orientation", "Orientation & framing", "pass", f"Aspect {m['aspectRatio']:.2f} matches chest radiograph geometry")
+    if m["meanIntensity"] < thr["minBrightness"]:
+        add("brightness", "Exposure / brightness", "fail", f"Image is too dark (mean intensity {m['meanIntensity']:.0f}/255).")
+    elif m["meanIntensity"] > thr["maxBrightness"]:
+        add("brightness", "Exposure / brightness", "fail", f"Image is too bright (mean intensity {m['meanIntensity']:.0f}/255).")
+    else:
+        add("brightness", "Exposure / brightness", "pass", f"Exposure acceptable (mean intensity {m['meanIntensity']:.0f}/255)")
+    if m["stdIntensity"] < thr["minStdContrast"]:
+        add("contrast", "Contrast / dynamic range", "fail",
+            f"Low contrast (σ {m['stdIntensity']:.1f}). The image is flat or washed out — no useful anatomy contrast.")
+    else:
+        add("contrast", "Contrast / dynamic range", "pass",
+            f"Adequate contrast (σ {m['stdIntensity']:.1f})")
+    if m["sharpness"] < thr["minSharpness"]:
+        add("sharpness", "Sharpness / blur", "fail", f"Image appears blurry (focus metric {m['sharpness']:.0f}).")
+    elif m["sharpness"] < thr["warnSharpness"]:
+        add("sharpness", "Sharpness / blur", "warn", f"Focus is borderline (metric {m['sharpness']:.0f}). Acceptable, but sharper is preferred.")
+    else:
+        add("sharpness", "Sharpness / blur", "pass", f"Sharp focus (metric {m['sharpness']:.0f})")
+    if m["structureScore"] < thr["minStructureScore"]:
+        add("chest_xray", "Frontal chest X-ray detection", "fail",
+            f"No thoracic anatomy signature detected (structure score {m['structureScore']}/100).")
+    elif m["structureScore"] < thr["warnStructureScore"]:
+        add("chest_xray", "Frontal chest X-ray detection", "warn",
+            f"Weak thoracic anatomy signature (structure score {m['structureScore']}/100). Analysis proceeds with reduced confidence.")
+    else:
+        add("chest_xray", "Frontal chest X-ray detection", "pass",
+            f"Thoracic anatomy detected (structure score {m['structureScore']}/100) — bright mediastinal band flanked by dark lung fields")
+    return checks
+
+
+def _class_thresholds() -> dict:
+    """Per-class decision thresholds. Global default 0.5; override per class
+    via the MEDVISION_CLASS_THRESHOLDS env var (JSON: label → threshold)."""
+    import json as _json
+
+    default = 0.5
+    raw = os.environ.get("MEDVISION_CLASS_THRESHOLDS", "")
+    if raw:
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, dict):
+                out = {}
+                for k, v in parsed.items():
+                    try:
+                        out[k] = max(0.05, min(0.95, float(v)))
+                    except (TypeError, ValueError):
+                        continue
+                if out:
+                    return {lab: out.get(lab, default) for lab in DISEASE_LABELS}
+        except Exception:
+            logger.warning("MEDVISION_CLASS_THRESHOLDS is not valid JSON — using global 0.5 default")
+    return {lab: default for lab in DISEASE_LABELS}
 
 
 def _profile_for_name(image_name: Optional[str]) -> dict:
@@ -487,6 +620,7 @@ def _build_prediction(image_name, image_data, model_name, clahe, noise_removal, 
     probabilities = dict(_profile_for_name(image_name))
     torch_meta = None
     x = None
+    img = None
 
     if engine is not None:
         torch, model, device = engine["torch"], engine["model"], engine["device"]
@@ -528,10 +662,12 @@ def _build_prediction(image_name, image_data, model_name, clahe, noise_removal, 
             logger.warning("PyTorch forward pass failed (%s) — using demo profile", exc)
             torch_meta = None
 
+    thresholds = _class_thresholds()
     diseases = [
         {
             "disease": lab,
             "probability": round(probabilities[lab], 4),
+            "threshold": thresholds[lab],
             "severityContribution": DISEASE_META[lab]["severityContribution"],
             "category": DISEASE_META[lab]["category"],
             "description": DISEASE_META[lab]["description"],
@@ -579,19 +715,83 @@ def _build_prediction(image_name, image_data, model_name, clahe, noise_removal, 
     second_prob = diseases[1]["probability"] if len(diseases) > 1 else 0.0
     uncertainty = _uncertainty_assessment(engine, x, top["probability"], second_prob, quality)
 
-    grad_cam_regions = []
-    if top["disease"] != "No Finding":
+    # ------------------------------------------------------------------
+    # REAL explainability: Grad-CAM / Grad-CAM++ (fine-tuned head) or
+    # class-agnostic feature activation (backbone-only mode). Computed from
+    # actual gradients/activations — never a hard-coded placeholder box.
+    # ------------------------------------------------------------------
+    heatmap_url = None
+    overlay_url = None
+    explainability = None
+    real_regions = []
+
+    if engine is not None and img is not None and x is not None:
+        try:
+            from app.models.gradcam import (
+                gradcam_map, gradcam_pp_map, feature_activation_map,
+                make_overlay, make_heatmap_image, encode_data_url,
+                peak_region, region_interpretation,
+            )
+
+            model = engine["model"]
+            target_layer = model.features.denseblock4.denselayer16.conv2
+            if engine.get("num_classes") in (10, 14):
+                # Disease-specific Grad-CAM on the top predicted class.
+                class_idx = DISEASE_LABELS.index(top["disease"]) if top["disease"] in DISEASE_LABELS else 0
+                cam = gradcam_map(model, x, class_idx, target_layer)
+                cam_pp = gradcam_pp_map(model, x, class_idx, target_layer)
+                overlay_cam = cam_pp
+                explainability = {
+                    "method": "grad-cam++",
+                    "alsoAvailable": ["grad-cam"],
+                    "targetClass": top["disease"],
+                    "layer": "features.denseblock4.denselayer16.conv2",
+                    "computed": True,
+                    "note": "Disease-specific attribution computed from the fine-tuned classification head.",
+                }
+            else:
+                # Backbone-only: honest class-agnostic feature activation.
+                overlay_cam = feature_activation_map(model, x, target_layer)
+                explainability = {
+                    "method": "feature-activation",
+                    "targetClass": None,
+                    "layer": "features.denseblock4.denselayer16.conv2",
+                    "computed": True,
+                    "note": ("Class-agnostic backbone feature activation. Disease-specific Grad-CAM "
+                              "requires a fine-tuned checkpoint under training/checkpoints."),
+                }
+
+            heatmap_url = encode_data_url(make_heatmap_image(overlay_cam, "jet"))
+            overlay_url = encode_data_url(make_overlay(img, overlay_cam, alpha=0.55, name="jet"))
+            region = peak_region(overlay_cam)
+            if region is not None:
+                region["name"] = f"Focal Region: {top['disease']}"
+                region["label"] = top["disease"]
+                region["confidence"] = top["probability"]
+                region["interpretation"] = region_interpretation(top["disease"], region, explainability["method"])
+                real_regions = [region]
+        except Exception as exc:
+            logger.warning("Explainability computation failed (%s)", exc)
+            explainability = {"method": "unavailable", "computed": False, "note": "Explainability could not be computed for this image."}
+
+    if real_regions:
+        grad_cam_regions = real_regions
+    elif engine is None and top["disease"] != "No Finding":
+        # Pure demo mode (torch absent): clearly-labelled illustrative region.
         grad_cam_regions = [{
             "name": f"Focal Region: {top['disease']}",
             "intensity": round(top["probability"] * 100),
             "bbox": {"x": 180, "y": 210, "width": 120, "height": 110, "label": top["disease"], "confidence": top["probability"]},
-            "interpretation": f"High Grad-CAM density highlighting peak neural response in thoracic region for {top['disease']}.",
+            "interpretation": f"Illustrative (demo) region for {top['disease']} — no real activation map in demo mode.",
+            "illustrative": True,
         }]
+    else:
+        grad_cam_regions = []
 
     engine_meta = torch_meta or {"source": "demo"}
     engine_meta.setdefault("pytorchVersion", (engine or {}).get("pytorch_version") or None)
     engine_meta.setdefault("checkpoint", (engine or {}).get("checkpoint"))
-    engine_meta.setdefault("models", [{"id": "densenet121", "name": "DenseNet-121 (CheXNet)", "auroc": 0.841}])
+    engine_meta.setdefault("models", [{"id": "densenet121", "name": "DenseNet-121 (CheXNet)", "auroc": 0.841, "metricSource": "published-reference (CheXNet, arXiv:1711.05225) — not measured on this build"}])
     # Canonical engine-mode metadata (honest labels — see _engine_meta)
     engine_meta.update(_engine_meta(engine))
 
@@ -599,6 +799,10 @@ def _build_prediction(image_name, image_data, model_name, clahe, noise_removal, 
         "id": f"pred_{int(time.time() * 1000)}",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "imageName": image_name or "uploaded_chest_xray.png",
+        "originalImageUrl": image_data or None,
+        "heatmapUrl": heatmap_url,
+        "heatmapOverlayUrl": overlay_url,
+        "explainability": explainability,
         "modelUsed": f"{model_name} (PyTorch + Grad-CAM)",
         "inferenceTimeMs": round(elapsed_ms, 1),
         "topDiagnosis": top["disease"],
@@ -608,16 +812,17 @@ def _build_prediction(image_name, image_data, model_name, clahe, noise_removal, 
         "diseases": diseases,
         "gradCamRegions": grad_cam_regions,
         "report": {
-            "patientId": f"PAT-{int(100000 + __import__('random').random() * 900000)}",
-            "patientAge": 52,
-            "patientSex": "M",
+            # Synthetic/demo identifier — never implies a real patient.
+            "patientId": f"PAT-DEMO-{int(1 + __import__('random').random() * 998):03d}",
+            "patientAge": None,
+            "patientSex": None,
             "studyDate": time.strftime("%Y-%m-%d"),
-            "indication": "Shortness of breath, cough, fever evaluation.",
-            "technique": "Upright PA Chest Radiograph (1024x1024).",
+            "indication": "Research/demo study — synthetic input, no real patient data.",
+            "technique": "Frontal chest radiograph (dimensions from the uploaded image).",
             "findings": findings,
             "impression": impression,
             "recommendations": recommendations,
-            "disclaimer": "Not for clinical diagnosis. Educational and research demonstration purposes only.",
+            "disclaimer": "This report is AI-generated and intended for research/educational decision support. It is not a substitute for interpretation by a qualified radiologist or physician.",
         },
         "keyMetrics": {"snr": 29.5, "resolution": "1024x1024", "meanIntensity": 115.2, "contrastRatio": 4.9},
         "engine": engine_meta,
@@ -630,6 +835,12 @@ def _build_prediction(image_name, image_data, model_name, clahe, noise_removal, 
         "typeCheck": type_check,
         "quality": {"score": quality, "threshold": _quality_threshold(), "method": "pixel-heuristics"},
         "ood": ood,
+        "validationChecks": _validation_checks(metrics, _validation_thresholds()),
+        "thresholdPolicy": {
+            "default": 0.5,
+            "perClass": any(t != 0.5 for t in thresholds.values()),
+            "note": "Global 0.5 unless overridden per class via MEDVISION_CLASS_THRESHOLDS.",
+        },
     }
 
 
@@ -659,19 +870,21 @@ def engine_status():
     return {
         "status": "ready",
         **_engine_meta(engine),
-        "models": [{"id": "densenet121", "name": "DenseNet-121 (CheXNet)", "auroc": 0.841}],
+        "models": [{"id": "densenet121", "name": "DenseNet-121 (CheXNet)", "auroc": 0.841, "metricSource": "published-reference (CheXNet, arXiv:1711.05225) — not measured on this build"}],
     }
 
 
 @app.get("/api/models")
 def list_models():
+    """Model registry. AUROC figures are PUBLISHED benchmarks (e.g. CheXNet
+    arXiv:1711.05225) referenced for context — NOT measurements of this build."""
     return {
         "models": [
-            {"id": "densenet121", "name": "DenseNet-121 (CheXNet)", "auroc": 0.841},
-            {"id": "efficientnet_b3", "name": "EfficientNet-B3", "auroc": 0.865},
-            {"id": "convnext_base", "name": "ConvNeXt-Base", "auroc": 0.882},
-            {"id": "swin_b", "name": "Swin Transformer", "auroc": 0.889},
-            {"id": "vit_b", "name": "Vision Transformer", "auroc": 0.878}
+            {"id": "densenet121", "name": "DenseNet-121 (CheXNet)", "auroc": 0.841, "metricSource": "published-reference (CheXNet, arXiv:1711.05225) — not measured on this build"},
+            {"id": "efficientnet_b3", "name": "EfficientNet-B3", "auroc": 0.865, "metricSource": "published-reference — not measured on this build"},
+            {"id": "convnext_base", "name": "ConvNeXt-Base", "auroc": 0.882, "metricSource": "published-reference — not measured on this build"},
+            {"id": "swin_b", "name": "Swin Transformer", "auroc": 0.889, "metricSource": "published-reference — not measured on this build"},
+            {"id": "vit_b", "name": "Vision Transformer", "auroc": 0.878, "metricSource": "published-reference — not measured on this build"}
         ]
     }
 
@@ -682,7 +895,7 @@ def predict(req: PredictRequest):
     if req.imageData and req.imageData.startswith("data:") and not req.imageData.lower().startswith("data:image/"):
         raise HTTPException(
             status_code=422,
-            detail="Unsupported image format. Upload a PNG, JPEG, WebP, or DICOM chest X-ray.",
+            detail="Unsupported image format. Upload a PNG, JPEG, or WebP chest X-ray (DICOM parsing is not supported in this research build).",
         )
     engine = get_engine()
 
@@ -713,7 +926,7 @@ def validate_image(req: PredictRequest):
     if req.imageData and req.imageData.startswith("data:") and not req.imageData.lower().startswith("data:image/"):
         raise HTTPException(
             status_code=422,
-            detail="Unsupported image format. Upload a PNG, JPEG, WebP, or DICOM chest X-ray.",
+            detail="Unsupported image format. Upload a PNG, JPEG, or WebP chest X-ray (DICOM parsing is not supported in this research build).",
         )
     engine = get_engine()
     metrics = _pixel_metrics(req.imageData)
@@ -721,12 +934,19 @@ def validate_image(req: PredictRequest):
     threshold = _quality_threshold()
     type_check = _classify_image_type(metrics)
     ood = _ood_assessment(metrics, quality)
+    thr = _validation_thresholds()
+    checks = _validation_checks(metrics, thr)
 
     passed = bool(metrics) and type_check["predicted"] == "chest_xray" and ood["verdict"] != "out" and quality >= threshold
     message = "" if passed else (
         "Image does not pass the AI safety gate — image type, out-of-distribution check, or quality score below threshold."
     )
     return {
+        # Structured per-check validation (PASS/WARN/FAIL) — the documented
+        # contract; `passed` / `quality` / `type` / `ood` remain for back-compat.
+        "valid": passed,
+        "quality_score": quality,
+        "checks": checks,
         "passed": passed,
         "type": type_check,
         "quality": {"score": quality, "threshold": threshold, "method": "pixel-heuristics"},
@@ -734,6 +954,83 @@ def validate_image(req: PredictRequest):
         "calibration": {"temperature": _temperature_for()},
         "engine": _engine_meta(engine),
         "message": message,
+    }
+
+
+class SimilarCasesRequest(BaseModel):
+    """Genuine embedding retrieval. `queryImage` is the study being analyzed;
+    `references` is a list of {id, title, label, imageData} cohort studies."""
+    queryImage: Optional[str] = None
+    references: Optional[List[dict]] = None
+
+
+def _embed_image(engine, image_data: Optional[str]):
+    """DenseNet-121 feature embedding (L2-normalized, 1024-d) for one image."""
+    import numpy as np
+    from PIL import Image
+    import torchvision.transforms as T
+
+    raw = _decode_image(image_data)
+    if not raw:
+        return None
+    try:
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        transforms = T.Compose([
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        torch, model, device = engine["torch"], engine["model"], engine["device"]
+        x = transforms(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            feats = model.features(x)
+            feats = torch.nn.functional.adaptive_avg_pool2d(feats, 1).flatten(1)
+            feats = torch.nn.functional.normalize(feats, p=2, dim=1)
+        return feats.cpu().numpy()[0].astype(np.float32)
+    except Exception as exc:
+        logger.debug("embedding failed: %s", exc)
+        return None
+
+
+@app.post("/api/similar-cases")
+def similar_cases(req: SimilarCasesRequest):
+    """Real similar-case retrieval: cosine similarity over genuine DenseNet-121
+    feature embeddings. Similarity is a model-feature similarity, NOT diagnostic
+    evidence. Returns 503 when the ML engine is offline (no fabricated results)."""
+    import numpy as np
+
+    engine = get_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="ML engine unavailable — similar-case retrieval requires the PyTorch engine.")
+    if not req.queryImage or not req.references:
+        raise HTTPException(status_code=422, detail="queryImage and references[] are required.")
+
+    q = _embed_image(engine, req.queryImage)
+    if q is None:
+        raise HTTPException(status_code=422, detail="Query image could not be decoded.")
+
+    cases = []
+    for ref in req.references:
+        if not isinstance(ref, dict) or not ref.get("imageData"):
+            continue
+        r = _embed_image(engine, ref["imageData"])
+        if r is None:
+            continue
+        sim = float(np.dot(q, r))  # both vectors are L2-normalized → cosine
+        cases.append({
+            "case_id": str(ref.get("id") or ref.get("name") or "ref"),
+            "title": ref.get("title"),
+            "label": ref.get("label") or ref.get("category"),
+            "similarity": round(max(0.0, min(1.0, sim)), 4),
+        })
+    cases.sort(key=lambda c: c["similarity"], reverse=True)
+    return {
+        "method": "cosine-similarity",
+        "embedding": "densenet121-features",
+        "device": str(engine.get("device") or "cpu"),
+        "disclaimer": "Similarity is a model-feature similarity computed over the curated demo cohort — it is NOT diagnostic evidence.",
+        "cases": cases,
     }
 
 

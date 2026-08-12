@@ -239,7 +239,7 @@ function corruptCheck(reason: string): ValidationCheck {
     key: 'format',
     label: 'File integrity & format',
     status: 'fail',
-    detail: `The image file is corrupted, truncated, or in an unsupported format — ${reason}. Re-export the image as PNG/JPEG/DICOM and retry.`,
+    detail: `The image file is corrupted, truncated, or in an unsupported format — ${reason}. Re-export the image as PNG/JPEG/WebP and retry.`,
   };
 }
 

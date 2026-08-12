@@ -200,6 +200,7 @@ Operational command center:
 |---|---|---|
 | `POST` | `/api/predict` | Authoritative server-gated inference. Body: `{ imageName, imageData, model?, clahe?, noiseRemoval? }`. The server validates **itself** (FastAPI safety gate) and refuses when the engine is offline: `422` (invalid image) or `503 ML_ENGINE_UNAVAILABLE` — **never a demo fallback for uploads**. Known sample studies (`chest_xray_*.dcm`) return a clearly-labelled demo profile. Returns `PredictionResult` + `engine` + `validationSource`/`predictionGenerated`/`reportAllowed`. |
 | `POST` | `/api/batch-predict` | `{ files: [{name,size,imageData?}], mode? }`. `mode: 'demo'` → flagged simulated profiles; otherwise engine-required with **per-file server-side validation** (offline → `503`). |
+| `POST` | `/api/similar-cases` | Real retrieval: `{ queryImage, references: [{id,title,label,imageData}] }` → DenseNet-121 feature embeddings + cosine similarity (engine required; `503` offline). Similarity is **not** diagnostic evidence. |
 | `POST` | `/api/chat` | Copilot. `{ prompt, history?, predictionContext?, provider? }` → Gemini reply or rule-engine fallback |
 | `GET` | `/api/health` | Service + Gemini-configured status |
 | `GET` | `/api/ready` | **Readiness probe** for orchestration: `200` with per-dependency checks (server / engine / storage / database), `503` when a configured dependency is down |
@@ -259,6 +260,22 @@ Operational command center:
 | `GET` | `/api/engine` | Engine readiness (probed by Express with a 30s cache) |
 | `GET` | `/api/health` · `/api/models` · `/` | Health, model registry, root banner |
 
+### 8a. Training & Evaluation (`training/`)
+
+A real, reproducible training pipeline ships in `training/`:
+
+```bash
+python training/train.py --config training/configs/train.yaml          # train on NIH ChestX-ray14
+python training/train.py --config ... --synthetic-sanity               # validate pipeline, no data needed
+python training/evaluate.py --checkpoint training/checkpoints/best.pt --config training/configs/train.yaml
+```
+
+- Patient-level train/val/test split, augmentation, inverse-frequency class weighting, cosine/step LR, early stopping, AMP (CUDA), best/last checkpoints, resume, experiment metadata JSON.
+- Device auto-detection **CUDA → MPS → CPU** — CPU training works everywhere.
+- `evaluate.py` writes AUROC (per-class/macro/micro), AUPRC, precision/recall/F1, sensitivity/specificity, best-F1 thresholds and ECE calibration to `artifacts/evaluation/` (JSON + PNG plots).
+- If the dataset is absent, both scripts report honestly — **no fabricated metrics, no fake training**.
+- `--synthetic-sanity` writes to `training/checkpoints/sanity/` so sanity weights are never mistaken for real model weights by the engine.
+
 ### 8b. AI Safety Pipeline (medically responsible by design)
 
 **Trust boundary — the client is never trusted.** Frontend validation, quality scores, OOD verdicts, image-type labels, and confidence values are **advisory UI only**; none of them can authorize inference. Inference runs only when the **server** has independently established that (1) an image payload is present, (2) the FastAPI ML engine is reachable, and (3) the FastAPI safety gate (type + OOD + quality) passed. When authoritative validation or the ML engine is unavailable, `/api/predict` returns `503` (`ML_ENGINE_UNAVAILABLE` / `VALIDATION_UNAVAILABLE`) with `predictionGenerated: false` — **no demo disease prediction is ever silently substituted for failed real inference**, and a real inference failure returns `502 INFERENCE_FAILED` rather than a synthetic diagnosis. The only exception is the explicit **sample workflow**: requests naming one of the bundled demo studies (server-verified filename) receive a clearly-labelled demo profile (`workflow: "sample"`, `validationSource: "sample-demo"`, `engineMode: "demo-engine"`).
@@ -272,6 +289,7 @@ DISEASE DETECTOR → EXPLAINABILITY → CALIBRATION → UNCERTAINTY → REPORT
 ```
 
 - **Stage 1–2 (client, `src/utils/imageValidation.ts`)** — format/corruption, resolution, grayscale, orientation, exposure, contrast, sharpness (Laplacian), thoracic anatomy. Rejections show per-check PASS/FAIL reasons and **block `/api/predict`** (the Express server returns `422` for failed validation reports — no fallback inference).
+- **Server-side per-check report** — `/api/validate` (and every prediction) returns a structured `checks[]` array with **PASS/WARN/FAIL** for `format` / `resolution` / `grayscale` / `contrast` / `brightness` / `sharpness` / `orientation` / `chest_xray`, each with a human-readable reason. All thresholds are env-configurable (`VALIDATION_*`).
 - **Stage 3 (engine, `backend/app/main.py`)** — `_pixel_metrics` computes brightness/contrast/sharpness/noise/color + a thoracic structure signature from actual pixels (PIL only, no numpy).
 - **Stage 4 — image-type classifier** — 11 classes (chest X-ray, other X-ray, CT, MRI, ultrasound, PET, mammography, photograph, animal, document, unknown). Labeled `heuristic-v1` — a trained CNN checkpoint (`training/checkpoints/image_type.pt`) is the documented upgrade path with an unchanged API contract.
 - **Stage 5 — OOD detection** — `feature-proxy-v1` scores deviation from the supported CXR distribution (weak anatomy, poor quality, colour content, extreme framing) → `in` / `borderline` / `out`.
@@ -280,7 +298,7 @@ DISEASE DETECTOR → EXPLAINABILITY → CALIBRATION → UNCERTAINTY → REPORT
 
 **Error states (API):** `422 VALIDATION_FAILED` / `UNSUPPORTED_IMAGE` / `INVALID_IMAGE` · `503 ML_ENGINE_UNAVAILABLE` / `VALIDATION_UNAVAILABLE` · `502 INFERENCE_FAILED` — every refusal carries `predictionGenerated: false` and `reportAllowed: false`, so no report, PDF/DOCX/QR, or diagnosis can be produced from an unsafe request.
 
-**Grad-CAM** (research reference implementation) lives in `backend/app/models/gradcam.py`; **DenseNet-121** in `backend/app/models/densenet.py`. The UI's heatmap rendering is currently a simulated SVG pipeline — swap `heatmapOverlayUrl` for a computed activation map to go fully real.
+**Grad-CAM / Grad-CAM++** (research implementations) live in `backend/app/models/gradcam.py`; **DenseNet-121** in `backend/app/models/densenet.py`. When the engine is online, `/api/predict` returns **real** activation maps: `heatmapUrl` + `heatmapOverlayUrl` are PNG data-URLs computed from actual gradients/activations, `gradCamRegions` carries a genuine peak-region bounding box (with thoracic-zone label) derived from the map, and `explainability.method` reports `grad-cam++`/`grad-cam` (fine-tuned head) or `feature-activation` (backbone-only — honestly labelled as not disease-specific). The remaining explainability-explorer methods are simulated CSS previews, explicitly labelled as such in the UI.
 
 **Dependencies:** `pip install -r backend/requirements.txt` (torch/torchvision are optional — the engine degrades gracefully without them).
 
@@ -297,6 +315,9 @@ Copy `.env.example` → `.env`:
 | `LOG_LEVEL` | Structured log verbosity: `debug`/`info`/`warn`/`error` | `info` |
 | `ALLOWED_ORIGINS` | Comma-separated CORS whitelist (empty = same-origin SPA, no CORS headers) | — |
 | `GEMINI_API_KEY` | Enables Gemini-generated reports + copilot responses (falls back to the rule engine when absent) | — |
+| `GEMINI_MODEL` | Gemini model id used for report + copilot synthesis (invalid ids degrade gracefully to the rule engine) | `gemini-3.6-flash` |
+| `MEDVISION_CLASS_THRESHOLDS` | Optional JSON per-class decision thresholds (`{"Pneumonia": 0.6, ...}`); default global 0.5 | `{}` |
+| `VALIDATION_*` | Per-check validation thresholds: `VALIDATION_MIN_SHORT_EDGE` (256), `VALIDATION_MAX_COLOR_DEVIATION` (18), `VALIDATION_MIN_STD_CONTRAST` (8), `VALIDATION_MIN_SHARPNESS` (15), `VALIDATION_WARN_SHARPNESS` (30), `VALIDATION_MIN_STRUCTURE_SCORE` (45), `VALIDATION_WARN_STRUCTURE_SCORE` (60), `VALIDATION_MIN_BRIGHTNESS` (20), `VALIDATION_MAX_BRIGHTNESS` (235), `VALIDATION_MAX_ASPECT_RATIO` (1.45) | defaults listed |
 | `PYTORCH_ENGINE_URL` | FastAPI engine base URL | `http://127.0.0.1:8000` |
 | `MEDVISION_TEMPERATURE` | Calibration temperature for confidence scaling (1.0 = identity) | `1.0` |
 | `QUALITY_THRESHOLD` | Minimum quality score for the safety gate (0–100) | `55` |

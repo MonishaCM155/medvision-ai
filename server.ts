@@ -287,7 +287,7 @@ function auditDetail(res: express.Response, action: string, state: string, outco
 // GET /api/engine — current inference engine status (for the UI badge)
 app.get('/api/engine', async (_req, res) => {
   const engine = await probeEngine();
-  res.json({ ...engine, baseUrl: ENGINE_BASE, note: 'Routes to FastAPI PyTorch engine when online; otherwise simulation.' });
+  res.json({ ...engine, baseUrl: ENGINE_BASE, note: 'Routes to FastAPI PyTorch engine when online. User uploads are blocked when the engine is offline (no demo fallback); bundled sample studies remain available as clearly-labelled demo profiles.' });
 });
 
 // Health Check Endpoint
@@ -474,6 +474,54 @@ app.post('/api/validate', async (req, res) => {
   }
 });
 
+// POST /api/similar-cases — genuine embedding retrieval, proxied to the FastAPI
+// engine (DenseNet-121 features + cosine similarity). Requires the engine;
+// returns 503 when it is offline — never fabricated similarity scores.
+app.post('/api/similar-cases', async (req, res) => {
+  try {
+    const { queryImage, references } = req.body || {};
+    const engine = await probeEngine();
+    if (engine.status !== 'ready') {
+      auditDetail(res, 'similar-cases', 'engine-offline', 'blocked');
+      return res.status(503).json({
+        ok: false,
+        status: 'engine_unavailable',
+        code: 'ML_ENGINE_UNAVAILABLE',
+        message: 'Similar-case retrieval requires the PyTorch engine (FastAPI on :8000).',
+        cases: [],
+      });
+    }
+    if (!queryImage || !references || !Array.isArray(references)) {
+      return res.status(422).json({ error: 'queryImage and references[] are required', cases: [] });
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const upstream = await fetch(`${ENGINE_BASE}/api/similar-cases`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ queryImage, references }),
+        signal: controller.signal,
+      });
+      if (!upstream.ok) throw new Error(`engine similar-cases http ${upstream.status}`);
+      const body = await upstream.json();
+      auditDetail(res, 'similar-cases', 'engine-embeddings', 'ok');
+      return res.json(body);
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (err: any) {
+    log.error('similar-cases-failed', { error: err.message });
+    res.status(502).json({
+      ok: false,
+      status: 'inference_failed',
+      code: 'INFERENCE_FAILED',
+      message: 'Similar-case retrieval failed.',
+      cases: [],
+    });
+  }
+});
+
 // GET /api/monitoring — live operational telemetry
 app.get('/api/monitoring', async (_req, res) => {
   const engine = await probeEngine();
@@ -551,7 +599,7 @@ app.post('/api/predict', async (req, res) => {
       monitor.rejectedImages += 1;
       auditDetail(res, 'predict', 'non-image-payload', 'rejected');
       return res.status(422).json({
-        error: 'Unsupported image format. Upload a PNG, JPEG, WebP, or DICOM chest X-ray.',
+        error: 'Unsupported image format. Upload a PNG, JPEG, or WebP chest X-ray (DICOM parsing is not supported in this research build).',
         code: 'UNSUPPORTED_IMAGE',
         predictionGenerated: false,
         reportAllowed: false,
@@ -640,8 +688,10 @@ app.post('/api/predict', async (req, res) => {
         if (!upstream.ok) throw new Error(`engine predict http ${upstream.status}`);
         const result = await upstream.json();
         result.engine = { ...(result.engine || {}), proxied: true, via: ENGINE_BASE };
-        result.originalImageUrl = imageData || result.originalImageUrl;
-        result.heatmapOverlayUrl = imageData || result.heatmapOverlayUrl;
+        // Preserve real maps computed by the engine; only echo the raw image
+        // when the engine did not produce one.
+        result.originalImageUrl = result.originalImageUrl || imageData;
+        result.heatmapOverlayUrl = result.heatmapOverlayUrl || imageData;
         result.claheApplied = !!clahe;
         result.noiseRemovalApplied = !!noiseRemoval;
         result.calibration =
@@ -769,7 +819,7 @@ Generate a JSON object strictly matching this schema:
 Ensure formal medical terminology (e.g., LUNGS, CARDIOMEDIASTINAL, PLEURA) and concise findings.`;
 
         const response = await ai.models.generateContent({
-          model: 'gemini-3.6-flash',
+          model: config.geminiModel,
           contents: prompt,
           config: {
             responseMimeType: 'application/json',
@@ -813,9 +863,9 @@ Ensure formal medical terminology (e.g., LUNGS, CARDIOMEDIASTINAL, PLEURA) and c
         },
       ] : [],
       report: {
-        patientId: `PAT-${Math.floor(100000 + Math.random() * 900000)}`,
-        patientAge: 52,
-        patientSex: 'M',
+        patientId: `PAT-DEMO-${(Math.floor(1 + Math.random() * 998)).toString().padStart(3, '0')}`,
+        patientAge: null,
+        patientSex: null,
         studyDate: new Date().toISOString().split('T')[0],
         indication: 'Shortness of breath, cough, fever evaluation.',
         technique: 'Upright PA Chest Radiograph (1024x1024).',
@@ -1059,11 +1109,19 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'Prompt is required' });
     }
 
-    const topDiag = predictionContext?.topDiagnosis || 'Pneumonia';
-    const topConf = predictionContext?.topConfidence
-      ? (predictionContext.topConfidence * 100).toFixed(1)
-      : '94.3';
-    const severity = predictionContext?.severity || 'High';
+    const hasContext = !!(predictionContext && (predictionContext.topDiagnosis || (predictionContext.diseases && predictionContext.diseases.length > 0)));
+    if (!hasContext) {
+      // No active analysis — answer honestly instead of inventing a diagnosis,
+      // a confidence value, or patient data.
+      return res.json({
+        reply: 'I can explain chest X-ray predictions, Grad-CAM heatmaps, radiology terminology, and study reports — but there is no active analysis in this session yet. Run an analysis first (upload a chest X-ray or choose a curated sample study) and I will walk you through the model\'s prediction, its confidence and uncertainty, and the regions it focused on.\n\n*Research and education only — this is not a clinical diagnosis.*',
+        provider: `${provider.toUpperCase()} (MedVision Rule Engine)`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    const topDiag = predictionContext?.topDiagnosis || null;
+    const topConf = predictionContext?.topConfidence ? (predictionContext.topConfidence * 100).toFixed(1) : null;
+    const severity = predictionContext?.severity || null;
     const modelUsed = predictionContext?.modelUsed || 'DenseNet-121 (PyTorch + Grad-CAM)';
 
     // System prompt for Gemini or fallback assistant
@@ -1098,7 +1156,7 @@ Respond to the user's question directly using structured Markdown (headers, bull
         ];
 
         const response = await ai.models.generateContent({
-          model: 'gemini-3.6-flash',
+          model: config.geminiModel,
           contents,
         });
 
@@ -1143,22 +1201,17 @@ The highlighted red and yellow regions represent peak spatial activations genera
 
 The model calculated a **${topConf}% confidence level** for ${topDiag}.
 
-* **Why is it not 100%?** In deep neural networks trained on CheXpert/NIH datasets, probabilities reflect softmax output distribution across 10 co-occurring diseases.
+* **Why is it not 100%?** Multi-label models emit an independent sigmoid probability per disease, and overlapping opacity patterns mean several classes can be active at once — so no single probability reaches certainty.
 * **Differential Considerations:** The model also assigned a **${(predictionContext?.diseases?.[1]?.probability * 100 || 82).toFixed(1)}% probability** to *${predictionContext?.diseases?.[1]?.disease || 'Lung Opacity'}*. High opacity overlap is common between severe consolidation and adjacent subsegmental atelectasis.
 * **Limitations:** Overlapping soft tissue density, patient rotation, or low inspiration depth can introduce model uncertainty. Clinical correlation is always mandatory.`;
     } else if (qLower.includes('compare report') || qLower.includes('compare with previous') || qLower.includes('previous study') || qLower.includes('interval change') || qLower.includes('serial')) {
       fallbackReply = `### 🆚 Comparison with Prior Studies
 
-Comparing the current study to the prior baseline for **${topDiag}**:
+No prior study is available in this session to compare against — MedVision AI does not store patient imaging and never infers interval changes.
 
-* **Current Confidence:** ${topConf}% → **Prior Baseline:** 82.4% (Δ +11.9 pts)
-* **Severity Trend:** ${severity} (current) vs Moderate (prior) — *worsening* pattern noted.
-* **New Findings:** The focal opacity demonstrates **increased density and size** (~18% interval growth) with stable pleural line.
-* **Stable Features:** Mediastinal contours unchanged; no new effusion, pneumothorax, or fracture.
+To perform a genuine comparison, upload the previous study and run it through the same pipeline, then review both model reports side by side with a qualified clinician. Interval-change claims (growth, resolution, stability) require the actual prior images.
 
-**Interpretation:** Findings are consistent with **progressive consolidation** — correlation with clinical status and repeat imaging in 2–4 weeks is advised.
-
-*Note: Comparison is simulation-based for this research demo.*`;
+*Note: This platform never fabricates a prior baseline or interval measurements.*`;
     } else if (qLower.includes('compare') || qLower.includes('versus') || qLower.includes('vs')) {
       fallbackReply = `### 🔬 Comparative Disease Differential
 

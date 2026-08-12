@@ -117,7 +117,7 @@ export const XrayUploader: React.FC<XrayUploaderProps> = ({ onRunInference, isLo
 
   const processFile = (file: File) => {
     if (!file.type.startsWith('image/')) {
-      setFileError('Please select a valid image file (PNG, JPEG, DICOM).');
+      setFileError('Please select a valid image file (PNG, JPEG, or WebP). DICOM files are not supported in this research build — convert to PNG/JPEG first.');
       return;
     }
     if (file.size > 20 * 1024 * 1024) {
@@ -189,7 +189,7 @@ export const XrayUploader: React.FC<XrayUploaderProps> = ({ onRunInference, isLo
             <span>Chest Radiograph Preprocessing &amp; Upload</span>
           </h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Select a curated clinical sample or upload a DICOM/PNG Chest X-ray. Every image is AI-validated before analysis.
+            Select a curated clinical sample or upload a PNG/JPEG/WebP Chest X-ray. Every image is AI-validated before analysis.
           </p>
         </div>
 
@@ -229,7 +229,7 @@ export const XrayUploader: React.FC<XrayUploaderProps> = ({ onRunInference, isLo
             <input
               ref={fileInputRef}
               type="file"
-              accept="image/*,.dcm"
+              accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
               onChange={handleFileChange}
               className="hidden"
             />
@@ -239,7 +239,7 @@ export const XrayUploader: React.FC<XrayUploaderProps> = ({ onRunInference, isLo
             <p className="text-xs font-semibold text-slate-700">
               Drag &amp; drop Chest X-ray image here, or <span className="text-indigo-600 underline">browse</span>
             </p>
-            <p className="text-[11px] text-slate-500 mt-1">Supports PNG, JPEG, DICOM 16-bit. Max 20MB.</p>
+            <p className="text-[11px] text-slate-500 mt-1">Supports PNG, JPEG, WebP. Max 20MB. DICOM parsing is not supported in this research build — convert DICOM to PNG/JPEG first.</p>
 
             {uploadedImage && (
               <div className="mt-3 inline-flex items-center gap-1.5 bg-indigo-50 text-indigo-700 border border-indigo-200 px-3 py-1 rounded-full text-xs font-mono font-medium">

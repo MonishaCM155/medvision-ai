@@ -20,7 +20,7 @@
 Designed for high-throughput clinical research and portfolio evaluation (NVIDIA, Machine Learning Engineer, Computer Vision AI Researcher), MedVision AI features:
 
 - 🩺 **10 Multi-Label Thoracic Pathologies**: No Finding, Pneumonia, COVID-19, Tuberculosis, Cardiomegaly, Pleural Effusion, Edema, Atelectasis, Pneumothorax, and Lung Opacity.
-- 🔍 **Interactive Grad-CAM Heatmaps**: Dual-view overlay with adjustable heat opacity, colormap selection (Jet, Turbo, Viridis, Inferno), and focal Region of Interest (ROI) bounding boxes.
+- 🔍 **Real Grad-CAM / Grad-CAM++ Heatmaps**: when the PyTorch engine is online, activation maps are computed server-side from real gradients/activations and returned as data-URL overlays with genuine peak-region bounding boxes; other explainability methods are clearly-marked simulated previews.
 - 📝 **AI Radiology Report Generator**: Dynamic structured reports (**Findings**, **Impression**, and **Recommendations**) powered server-side by `@google/genai` Gemini 3.6 Flash.
 - 📊 **Model Comparison & Benchmarks**: Comparative evaluation of DenseNet-121 (CheXNet), EfficientNet-B3, ConvNeXt-Base, Swin Transformer (Swin-B), and Vision Transformer (ViT-B/16).
 - ⚙️ **MLOps & Probability Calibration**: Expected Calibration Error (ECE) analysis, Platt scaling reliability curves, and MLflow experiment logging.
@@ -67,10 +67,10 @@ Designed for high-throughput clinical research and portfolio evaluation (NVIDIA,
 ## 🛠️ Tech Stack
 
 - **Frontend**: React 19, TypeScript, Vite, TailwindCSS, Recharts, Lucide Icons, jsPDF, html2canvas.
-- **Backend**: Express (Node.js) / FastAPI (Python 3.10), Uvicorn, Pydantic, SQLAlchemy.
-- **Machine Learning & Vision**: PyTorch 2.2, TorchVision, OpenCV, Albumentations, Captum, Grad-CAM, ONNX Runtime.
-- **LLM Integration**: `@google/genai` (Gemini 3.6 Flash) server-side proxy.
-- **DevOps & MLOps**: Docker, Docker Compose, MLflow, GitHub Actions CI.
+- **Backend**: Express (Node.js) / FastAPI (Python 3.12), Uvicorn, Pydantic.
+- **Machine Learning & Vision**: PyTorch, TorchVision, NumPy, Pillow, Grad-CAM / Grad-CAM++ (reference implementation in `backend/app/models/gradcam.py`). Captum / OpenCV are optional extras in `requirements.txt`.
+- **LLM Integration**: `@google/genai` (Gemini, configurable via `GEMINI_MODEL`) server-side proxy with an offline rule-engine fallback.
+- **DevOps & MLOps**: Docker, Docker Compose (app + Postgres + MLflow), GitHub Actions CI.
 
 ---
 
@@ -102,18 +102,28 @@ docker-compose up --build -d
 
 ## 🧪 Training & Evaluation Pipeline
 
-To train the PyTorch DenseNet-121 backbone on the NIH ChestX-ray14 dataset:
+A complete, reproducible training pipeline lives in `training/` (DenseNet-121
+multi-label head, patient-level split, augmentation, class weighting, cosine
+scheduling, early stopping, checkpoints, resume, device auto-detection
+CUDA → MPS → CPU).
 
 ```bash
-python training/train.py \
-    --data_dir ./datasets/nih_chestxray \
-    --architecture densenet121 \
-    --epochs 50 \
-    --batch_size 32 \
-    --lr 1e-4 \
-    --loss_fn weighted_bce \
-    --amp_fp16
+# Train on NIH ChestX-ray14 (edit training/configs/train.yaml first)
+python training/train.py --config training/configs/train.yaml
+
+# Validate the whole pipeline on a tiny synthetic dataset (no data required)
+python training/train.py --config training/configs/train.yaml --synthetic-sanity
+
+# Evaluate a checkpoint on the patient-level test split
+python training/evaluate.py --checkpoint training/checkpoints/best.pt \
+    --config training/configs/train.yaml
 ```
+
+If the dataset is not present, `train.py` reports honestly
+("Training not executed because the required dataset is unavailable...")
+rather than pretending. The inference engine scans `training/checkpoints/*.pt`
+and switches to **full real inference** when it finds a fine-tuned 10/14-class
+head (see README-SUITE §8 for the three-tier honesty chain).
 
 ---
 

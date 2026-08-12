@@ -1,8 +1,9 @@
-import React, { useState, useMemo } from 'react';
-import { Eye, Layers, Download, Sliders, Sparkles, Target, ZoomIn, Info, ChevronDown, GitBranch, ScanSearch, Wand2 } from 'lucide-react';
+import React, { useState, useMemo, useEffect } from 'react';
+import { Eye, Layers, Download, Sliders, Sparkles, Target, ZoomIn, Info, ChevronDown, GitBranch, ScanSearch, Wand2, Loader2, FlaskConical } from 'lucide-react';
 import { PredictionResult } from '../types';
 import { SAMPLE_XRAYS } from '../data/sampleXrays';
 import { EXPLAINABILITY_METHODS } from '../data/mockEnterprise';
+import { api } from '../services/api';
 import { cn } from '../utils/cn';
 
 interface GradCamViewerProps {
@@ -23,10 +24,24 @@ export const GradCamViewer: React.FC<GradCamViewerProps> = ({ result }) => {
   const [explainMethodId, setExplainMethodId] = useState('gradcam');
   const explainMethod = EXPLAINABILITY_METHODS.find((m) => m.id === explainMethodId) ?? EXPLAINABILITY_METHODS[0];
 
+  // Real server-computed activation map (Grad-CAM / Grad-CAM++ when a fine-
+  // tuned head is loaded; class-agnostic feature activation for the backbone).
+  const realMapUrl =
+    result.heatmapOverlayUrl && result.heatmapOverlayUrl !== result.originalImageUrl ? result.heatmapOverlayUrl : null;
+  const serverMethod = result.explainability?.method || null;
+  const realMapActive = !!realMapUrl && !!serverMethod && serverMethod !== 'unavailable';
+  const methodMatchesServer =
+    (serverMethod === 'grad-cam' && method === 'Grad-CAM') ||
+    (serverMethod === 'grad-cam++' && method === 'Grad-CAM++') ||
+    (serverMethod === 'feature-activation' && (method === 'Grad-CAM' || method === 'Grad-CAM++'));
+  const showingSimulated = !realMapActive || !methodMatchesServer;
+  const serverMethodLabel =
+    serverMethod === 'grad-cam++' ? 'Grad-CAM++' : serverMethod === 'grad-cam' ? 'Grad-CAM' : serverMethod === 'feature-activation' ? 'Feature Activation' : null;
+
   const handleDownloadHeatmap = () => {
     const link = document.createElement('a');
     link.download = `gradcam_${result.imageName}_${method}.png`;
-    link.href = result.heatmapOverlayUrl || result.originalImageUrl;
+    link.href = realMapUrl || result.heatmapOverlayUrl || result.originalImageUrl;
     link.click();
   };
 
@@ -41,21 +56,84 @@ export const GradCamViewer: React.FC<GradCamViewerProps> = ({ result }) => {
     }));
   }, [result.diseases]);
 
-  // Similar case retrieval (simulated embeddings search)
-  const similarCases = useMemo(() => {
-    return SAMPLE_XRAYS.map((s) => ({
-      id: s.id,
-      title: s.title,
-      category: s.category,
-      image: s.svgDataUrl,
-      similarity:
-        s.category === (result.topDiagnosis.includes('No Finding') ? 'No Finding' : result.topDiagnosis.split(' ')[0])
-          ? 94 + Math.floor(Math.random() * 5)
-          : 58 + Math.floor(Math.random() * 30),
-    }))
-      .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, 3);
-  }, [result.topDiagnosis]);
+  // Similar case retrieval — genuine DenseNet-121 feature embeddings + cosine
+  // similarity via the FastAPI engine. Falls back to clearly-labelled demo
+  // similarities when the engine is offline (never presented as real).
+  const [similarCases, setSimilarCases] = useState<
+    { id: string; title: string; category?: string; image: string; similarity: number; source: 'real' | 'demo' }[]
+  >([]);
+  const [simState, setSimState] = useState<'loading' | 'real' | 'offline'>('loading');
+
+  const rasterize = (dataUrl: string, size = 256): Promise<string> =>
+    new Promise((resolve) => {
+      const img = new Image();
+      const canvas = document.createElement('canvas');
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      img.onload = () => {
+        try {
+          ctx?.drawImage(img, 0, 0, size, size);
+          resolve(canvas.toDataURL('image/png'));
+        } catch {
+          resolve('');
+        }
+      };
+      img.onerror = () => resolve('');
+      img.src = dataUrl;
+    });
+
+  useEffect(() => {
+    let cancelled = false;
+    const querySrc = result.originalImageUrl;
+    if (!querySrc) {
+      setSimState('offline');
+      return;
+    }
+    setSimState('loading');
+    (async () => {
+      const query = querySrc.startsWith('data:image/svg') ? await rasterize(querySrc) : querySrc;
+      const refs = await Promise.all(
+        SAMPLE_XRAYS.map(async (s) => ({
+          id: s.id,
+          title: s.title,
+          category: s.category,
+          imageData: await rasterize(s.svgDataUrl),
+        }))
+      );
+      const usable = refs.filter((r) => r.imageData);
+      if (!query || usable.length === 0) {
+        if (!cancelled) setSimState('offline');
+        return;
+      }
+      try {
+        const res = await api.getSimilarCases(query, usable);
+        if (!cancelled && res.cases && res.cases.length > 0) {
+          setSimilarCases(
+            res.cases.map((c) => {
+              const sample = SAMPLE_XRAYS.find((s) => s.id === c.case_id);
+              return {
+                id: c.case_id,
+                title: c.title || sample?.title || c.label || 'Reference study',
+                category: c.label || sample?.category,
+                image: sample?.svgDataUrl || '',
+                similarity: c.similarity,
+                source: 'real' as const,
+              };
+            })
+          );
+          setSimState('real');
+          return;
+        }
+        if (!cancelled) setSimState('offline');
+      } catch {
+        if (!cancelled) setSimState('offline');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [result.originalImageUrl, result.id]);
 
   const decisionFlow = [
     { step: 'Preprocessing', detail: 'CLAHE + bilateral denoise · 1024×1024 normalized tensor', icon: '🖼️' },
@@ -186,7 +264,9 @@ export const GradCamViewer: React.FC<GradCamViewerProps> = ({ result }) => {
             <Wand2 className="w-3.5 h-3.5 text-violet-500" />
             Explainability Method Explorer
           </span>
-          <span className="text-[9px] font-mono text-slate-400">Captum · 6 methods</span>
+          <span className="text-[9px] font-mono text-slate-400">
+            {realMapActive ? 'Server: ' + (serverMethodLabel ?? serverMethod) : 'Simulated previews'}
+          </span>
         </div>
         <div className="flex flex-wrap gap-1.5">
           {EXPLAINABILITY_METHODS.map((m) => (
@@ -206,7 +286,20 @@ export const GradCamViewer: React.FC<GradCamViewerProps> = ({ result }) => {
           ))}
         </div>
         <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed">
-          <strong>{explainMethod.name}:</strong> {explainMethod.description} Visualization rendered for the {result.diseases[0]?.disease ?? 'primary'} class.
+          <strong>{explainMethod.name}:</strong> {explainMethod.description}{' '}
+          {realMapActive && methodMatchesServer ? (
+            <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
+              — real {serverMethodLabel} map computed server-side (engine {result.engine?.device ?? 'CPU'}).
+            </span>
+          ) : realMapActive ? (
+            <span className="text-amber-600 dark:text-amber-400 font-semibold">
+              — SIMULATED PREVIEW: the backend computed {serverMethodLabel}, not {explainMethod.name}. CSS filter shown for illustration only.
+            </span>
+          ) : (
+            <span className="text-amber-600 dark:text-amber-400 font-semibold">
+              — SIMULATED PREVIEW: no real activation map is available for this result (demo engine or engine offline).
+            </span>
+          )}
         </p>
       </div>
 
@@ -221,14 +314,21 @@ export const GradCamViewer: React.FC<GradCamViewerProps> = ({ result }) => {
               </div>
             </div>
             <div className="space-y-2 text-center">
-              <span className="text-xs font-semibold text-indigo-300 font-mono">{explainMethod.name} Map</span>
+              <span className="text-xs font-semibold text-indigo-300 font-mono">
+                {realMapActive && methodMatchesServer ? `${serverMethodLabel} Map (real)` : `${explainMethod.name} Map`}
+              </span>
               <div className="relative aspect-square rounded-lg overflow-hidden border border-slate-800 bg-slate-950">
                 <img
-                  src={result.heatmapOverlayUrl}
-                  alt="Grad-CAM"
+                  src={realMapUrl || result.heatmapOverlayUrl || result.originalImageUrl}
+                  alt="Activation map"
                   className="w-full h-full object-contain"
-                  style={{ filter: explainMethod.filter }}
+                  style={{ filter: showingSimulated ? explainMethod.filter : undefined }}
                 />
+                {showingSimulated && (
+                  <span className="absolute top-2 right-2 bg-amber-500/90 text-slate-950 text-[9px] font-black px-1.5 py-0.5 rounded">
+                    SIMULATED
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -237,19 +337,29 @@ export const GradCamViewer: React.FC<GradCamViewerProps> = ({ result }) => {
             {/* Original Image */}
             <img src={result.originalImageUrl} alt="Original" className="absolute inset-0 w-full h-full object-contain" />
 
-            {/* Heatmap Overlay with Opacity */}
+            {/* Heatmap Overlay with Opacity — the real engine map when available */}
             <img
-              src={result.heatmapOverlayUrl}
+              src={realMapUrl || result.heatmapOverlayUrl || result.originalImageUrl}
               alt="Heatmap"
-              style={{ opacity: viewMode === 'heatmap_only' ? 1 : opacity, filter: explainMethod.filter }}
+              style={{ opacity: viewMode === 'heatmap_only' ? 1 : opacity, filter: showingSimulated ? explainMethod.filter : undefined }}
               className="absolute inset-0 w-full h-full object-contain mix-blend-screen transition-opacity"
             />
 
-            {/* DICOM Info overlay */}
+            {showingSimulated && (
+              <span className="absolute top-3 right-3 bg-amber-500/90 text-slate-950 text-[9px] font-black px-1.5 py-0.5 rounded z-10">
+                SIMULATED PREVIEW
+              </span>
+            )}
+
+            {/* Study info overlay */}
             <div className="absolute top-3 left-3 bg-slate-950/80 backdrop-blur px-2.5 py-1 rounded-md border border-slate-800 text-[10px] font-mono text-slate-300 space-y-0.5">
-              <div>METHOD: {explainMethod.name.toUpperCase()}</div>
+              <div>METHOD: {realMapActive && methodMatchesServer ? (serverMethodLabel ?? 'SERVER').toUpperCase() : explainMethod.name.toUpperCase()}</div>
               <div>LAYER: denseblock4.conv2</div>
-              <div>SPECTRUM: {colormap}</div>
+              {realMapActive && methodMatchesServer ? (
+                <div className="text-emerald-400">SOURCE: ENGINE · {result.engine?.device ?? 'CPU'}</div>
+              ) : (
+                <div>SPECTRUM: {colormap}</div>
+              )}
             </div>
 
             <div className="absolute bottom-3 right-3 bg-slate-950/80 backdrop-blur px-2.5 py-1 rounded-md border border-slate-800 text-[10px] font-mono text-indigo-300">
@@ -341,24 +451,76 @@ export const GradCamViewer: React.FC<GradCamViewerProps> = ({ result }) => {
         <p className="text-[11px] font-bold text-slate-600 dark:text-slate-300 flex items-center gap-1.5">
           <ScanSearch className="w-3.5 h-3.5 text-sky-500" />
           Similar Case Retrieval
-          <span className="text-[9px] font-mono text-slate-400 font-normal">· Embedding search over curated cohort</span>
+          <span className="text-[9px] font-mono text-slate-400 font-normal">
+            · {simState === 'real' ? 'DenseNet-121 embeddings + cosine similarity' : 'over curated demo cohort'}
+          </span>
         </p>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-          {similarCases.map((c) => (
-            <div key={c.id} className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden group hover:border-sky-400/60 hover:shadow-md transition-all">
-              <div className="relative h-20 bg-slate-900 overflow-hidden">
-                <img src={c.image} alt={c.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" />
-                <span className="absolute top-1.5 right-1.5 text-[9px] font-mono font-bold bg-slate-950/80 border border-slate-700 text-sky-300 px-1.5 py-0.5 rounded">
-                  {c.similarity}% sim
-                </span>
-              </div>
-              <div className="p-2.5">
-                <p className="text-[10px] font-bold text-slate-800 dark:text-slate-100 truncate">{c.title}</p>
-                <p className="text-[9px] text-slate-400 mt-0.5">{c.category}</p>
-              </div>
+
+        {simState === 'loading' && (
+          <div className="flex items-center gap-2 text-[10px] text-slate-400 py-3">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            Embedding query image and comparing against the reference cohort…
+          </div>
+        )}
+
+        {simState === 'real' && (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              {similarCases.slice(0, 3).map((c) => (
+                <div key={c.id} className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden group hover:border-sky-400/60 hover:shadow-md transition-all">
+                  <div className="relative h-20 bg-slate-900 overflow-hidden">
+                    <img src={c.image} alt={c.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" />
+                    <span className="absolute top-1.5 right-1.5 text-[9px] font-mono font-bold bg-slate-950/80 border border-slate-700 text-sky-300 px-1.5 py-0.5 rounded">
+                      {(c.similarity * 100).toFixed(0)}% sim
+                    </span>
+                  </div>
+                  <div className="p-2.5">
+                    <p className="text-[10px] font-bold text-slate-800 dark:text-slate-100 truncate">{c.title}</p>
+                    <p className="text-[9px] text-slate-400 mt-0.5">{c.category}</p>
+                  </div>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
+            <p className="text-[9px] text-slate-400 leading-relaxed">
+              Similarity = cosine similarity of genuine DenseNet-121 feature embeddings over the curated demo cohort.{" "}
+              <strong>Similarity is not diagnostic evidence.</strong>
+            </p>
+          </>
+        )}
+
+        {simState === 'offline' && (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              {SAMPLE_XRAYS.slice(0, 3)
+                .map((s) => ({
+                  id: s.id,
+                  title: s.title,
+                  category: s.category,
+                  image: s.svgDataUrl,
+                  similarity: 58 + Math.floor(Math.random() * 30),
+                }))
+                .sort((a, b) => b.similarity - a.similarity)
+                .map((c) => (
+                  <div key={c.id} className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden opacity-80">
+                    <div className="relative h-20 bg-slate-900 overflow-hidden">
+                      <img src={c.image} alt={c.title} className="w-full h-full object-cover" />
+                      <span className="absolute top-1.5 right-1.5 text-[9px] font-mono font-bold bg-slate-950/80 border border-amber-500/50 text-amber-300 px-1.5 py-0.5 rounded">
+                        DEMO · {c.similarity}%
+                      </span>
+                    </div>
+                    <div className="p-2.5">
+                      <p className="text-[10px] font-bold text-slate-800 dark:text-slate-100 truncate">{c.title}</p>
+                      <p className="text-[9px] text-slate-400 mt-0.5">{c.category}</p>
+                    </div>
+                  </div>
+                ))}
+            </div>
+            <p className="text-[9px] text-amber-600 dark:text-amber-400 leading-relaxed">
+              <FlaskConical className="inline w-3 h-3 mr-1" />
+              Demo similarity — the ML engine is offline, so these are illustrative values, not model-feature similarities.
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

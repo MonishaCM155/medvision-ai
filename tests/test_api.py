@@ -8,8 +8,12 @@ Every test skips gracefully when its dependencies are missing, so the suite
 never hard-fails a fresh checkout.
 """
 
+import io
 import os
 import sys
+import base64
+
+import numpy as np
 import pytest
 
 # Skip the ~32MB ImageNet weight download — the suite validates contracts,
@@ -34,6 +38,113 @@ from app.main import IMAGE_TYPES, get_engine  # noqa: E402
 def warm_engine():
     get_engine()
     yield
+
+
+def _synthetic_cxr_data_url(size=512, seed=0):
+    """A synthetic image carrying the thoracic signature the safety gate expects."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("L", (size, size), 90)
+    d = ImageDraw.Draw(img)
+    d.rectangle([int(size * 0.40), int(size * 0.08), int(size * 0.60), int(size * 0.92)], fill=175)
+    d.rectangle([int(size * 0.25), int(size * 0.05), int(size * 0.75), int(size * 0.32)], fill=135)
+    arr = np.asarray(img, dtype=np.float32)
+    arr += np.random.default_rng(seed).normal(0, 6, arr.shape).astype(np.float32)
+    img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def test_validate_structured_checks_contract():
+    """POST /api/validate returns the documented per-check validation report:
+    PASS/WARN/FAIL for format/resolution/grayscale/contrast/brightness/
+    sharpness/orientation/chest_xray, plus valid/quality_score aliases."""
+    data_url = _synthetic_cxr_data_url()
+    res = client.post("/api/validate", json={"imageName": "cxr.png", "imageData": data_url})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["valid"] is True
+    assert body["quality_score"] == body["quality"]["score"]
+    checks = body["checks"]
+    assert len(checks) == 8
+    keys = {c["key"] for c in checks}
+    assert keys == {"format", "resolution", "grayscale", "contrast", "brightness", "sharpness", "orientation", "chest_xray"}
+    for c in checks:
+        assert c["status"] in ("pass", "warn", "fail")
+        assert c["detail"]
+
+
+def test_predict_diseases_include_threshold():
+    res = client.post("/api/predict", json={"imageName": "covid_patient_01.png"})
+    assert res.status_code == 200
+    for d in res.json()["diseases"]:
+        assert "threshold" in d
+        assert 0 < d["threshold"] < 1
+
+
+def test_predict_real_explainability_and_validation():
+    """With the engine up (backbone mode under MEDVISION_SKIP_PRETRAINED=1), a
+    validated synthetic CXR yields a real activation map, overlay, peak region
+    and server validation checks — never a placeholder."""
+    if get_engine() is None:
+        pytest.skip("PyTorch engine unavailable")
+    data_url = _synthetic_cxr_data_url()
+    res = client.post("/api/predict", json={"imageName": "cxr.png", "imageData": data_url})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["explainability"]["computed"] is True
+    assert body["explainability"]["method"] in ("grad-cam", "grad-cam++", "feature-activation")
+    assert body["heatmapUrl"].startswith("data:image/png")
+    assert body["heatmapOverlayUrl"].startswith("data:image/png")
+    assert body["originalImageUrl"] == data_url
+    assert len(body["gradCamRegions"]) >= 1
+    region = body["gradCamRegions"][0]
+    assert "bbox" in region and "zone" in region
+    assert len(body["validationChecks"]) == 8
+
+
+def test_similar_cases_requires_engine_and_payload():
+    res = client.post("/api/similar-cases", json={})
+    if get_engine() is None:
+        assert res.status_code == 503
+    else:
+        assert res.status_code == 422
+
+
+def test_similar_cases_real_embeddings():
+    """Genuine embedding retrieval: real DenseNet-121 features + cosine
+    similarity, sorted descending, bounded [0,1]."""
+    if get_engine() is None:
+        pytest.skip("PyTorch engine unavailable")
+    q = _synthetic_cxr_data_url(seed=1)
+    refs = [
+        {"id": "a", "title": "A", "label": "Pneumonia", "imageData": _synthetic_cxr_data_url(seed=2)},
+        {"id": "b", "title": "B", "label": "Cardiomegaly", "imageData": _synthetic_cxr_data_url(seed=3)},
+        {"id": "c", "title": "C", "label": "No Finding", "imageData": _synthetic_cxr_data_url(seed=4)},
+    ]
+    res = client.post("/api/similar-cases", json={"queryImage": q, "references": refs})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["embedding"] == "densenet121-features"
+    assert len(body["cases"]) == 3
+    sims = [c["similarity"] for c in body["cases"]]
+    assert sims == sorted(sims, reverse=True)
+    assert all(0 <= s <= 1 for s in sims)
+    assert "not diagnostic evidence" in body["disclaimer"].lower()
+
+
+def test_predict_rejects_non_cxr_payload_checks_explainable():
+    """Rejections stay contract-consistent: a failed gate returns 422 with a
+    server-side reason — no heatmap, no fabricated prediction."""
+    pil = pytest.importorskip("PIL", reason="PIL not installed")
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (120, 40, 200)).save(buf, "PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    res = client.post("/api/predict", json={"imageName": "colorful_photo.jpg", "imageData": data_url})
+    assert res.status_code == 422
 
 
 def test_root_banner():

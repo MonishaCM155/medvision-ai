@@ -92,6 +92,9 @@ export const config = {
   // is accepted as an alias.
   engineBase: str('PYTORCH_ENGINE_URL', str('FASTAPI_URL', 'http://127.0.0.1:8000')),
   geminiApiKey: str('GEMINI_API_KEY', ''),
+  // Gemini model used for report + copilot synthesis. Overridable via env;
+  // if the model id is invalid the request fails gracefully to the rule engine.
+  geminiModel: str('GEMINI_MODEL', 'gemini-3.6-flash'),
 
   // Security (public research mode — no authentication, but abuse protection)
   apiRateLimit: int(

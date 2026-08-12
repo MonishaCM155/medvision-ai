@@ -126,7 +126,7 @@ export const ReportCard: React.FC<ReportCardProps> = ({
         </div>
         <div>
           <span className="text-slate-500 block text-[10px]">AGE / SEX:</span>
-          <span className="text-slate-900">{report.patientAge || 52} Y.O. / {report.patientSex || 'M'}</span>
+          <span className="text-slate-900">{report.patientAge != null ? `${report.patientAge} Y.O.` : 'Age n/a'} / {report.patientSex || 'Sex n/a'}</span>
         </div>
         <div>
           <span className="text-slate-500 block text-[10px]">STUDY DATE:</span>
