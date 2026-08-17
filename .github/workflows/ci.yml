@@ -45,3 +45,5 @@ jobs:
     - name: Run End-to-End Engine Smoke Test
       run: |
         MEDVISION_SKIP_PRETRAINED=1 python tests/e2e_smoke.py
+
+httpx2

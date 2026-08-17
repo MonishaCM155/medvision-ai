@@ -116,12 +116,12 @@ def ingest_covid():
                 continue
             fname = (row.get("filename") or "").strip()
             pid_raw = (row.get("patientid") or "").strip() or ("anon_" + fname)
-            # Cohen has both .jpg and .png for the same case; keep one format.
-            case_key = (pid_raw, finding)
-            if case_key in seen_cases:
+            # Cohen has both .jpg and .png for the same X-ray; keep one format.
+            root_key = os.path.splitext(fname)[0]
+            if root_key in seen_cases:
                 excluded += 1
                 continue
-            seen_cases.add(case_key)
+            seen_cases.add(root_key)
             path = os.path.join(img_dir, fname)
             if not os.path.exists(path):
                 print(f"[covid19] missing image file skipped: {fname}")
