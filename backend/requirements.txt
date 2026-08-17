@@ -15,3 +15,5 @@ torchvision>=0.16
 # Explainability (optional)
 captum>=0.7
 opencv-python>=4.9
+
+httpx2
