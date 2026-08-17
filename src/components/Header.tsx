@@ -142,14 +142,16 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, onToggl
                   ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border-emerald-500/25'
                   : 'text-amber-600 dark:text-amber-400 bg-amber-500/10 border-amber-500/25'
               )}
-              title={engine?.note || (engine ? `Engine: ${engine.source}` : 'Probing inference engine…')}
+              title={engine?.note || (engine ? `Engine: ${engine.source}${engine.checkpointFile ? ` · ${engine.checkpointFile}` : ''}` : 'Probing inference engine…')}
             >
               <span className={cn('w-1.5 h-1.5 rounded-full', engine?.status === 'ready' && String(engine.source).startsWith('pytorch') ? 'live-dot bg-emerald-500' : 'bg-amber-500')} />
               {!engine
                 ? 'AI CORE …'
-                : engine.status === 'ready' && String(engine.source).startsWith('pytorch')
-                  ? `PYTORCH · ${String(engine.device).startsWith('cuda') ? 'CUDA' : 'CPU'}`
-                  : 'DEMO ENGINE'}
+                : engine.source === 'pytorch-checkpoint'
+                  ? `REAL MODEL · ${String(engine.device).startsWith('cuda') ? 'CUDA' : 'CPU'}`
+                  : engine.status === 'ready' && engine.source === 'pytorch-backbone'
+                    ? `BACKBONE · ${String(engine.device).startsWith('cuda') ? 'CUDA' : 'CPU'}`
+                    : 'DEMO ENGINE'}
             </span>
 
             {/* Copilot quick toggle */}

@@ -312,6 +312,21 @@ export interface EngineStatus {
   checkedAt?: number;
   baseUrl?: string;
   note?: string;
+  // Fine-tuned checkpoint provenance (only present when a real checkpoint is
+  // loaded — the UI never fabricates these for backbone/demo modes).
+  engineMode?: string; // 'real-model' | 'backbone-live' | 'demo-engine'
+  weightsLoaded?: boolean;
+  predictionSource?: string; // 'real-inference' | 'backbone+demo-profile' | 'demo-profile'
+  checkpointFile?: string;
+  checkpointKind?: string;
+  checkpointEpoch?: number | null;
+  checkpointValMacroAuc?: number | null;
+  trainingDate?: string | null;
+  dataset?: string | null;
+  trainedClasses?: string[] | null;
+  unavailableClasses?: string[] | null;
+  thresholds?: Record<string, number> | null;
+  thresholdPolicy?: string | null;
 }
 
 export interface CalibrationInfo {

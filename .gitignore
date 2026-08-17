@@ -21,6 +21,8 @@ data/
 artifacts/
 training/checkpoints/
 training/datasets/
+training/splits/
+training/results/
 *.pt
 *.pth
 
@@ -33,3 +35,13 @@ training/datasets/
 .env
 .env.*
 !.env.example
+
+# Local medical datasets
+datasets/
+medvision-ai-training-data.zip
+
+# Trained model checkpoints
+training/checkpoints/
+
+# Training result artifacts
+training/results/

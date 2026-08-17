@@ -91,8 +91,15 @@ def load_nih_csv(labels_csv: str, images_dir: str, label_names: List[str], label
 
 
 def labels_to_vector(record_labels: List[str], label_names: List[str]) -> np.ndarray:
+    """Multi-label one-hot. "No Finding" is exclusive: it sets the No Finding
+    column (when present) and suppresses every other column — exactly matching
+    the inline vectors used for training (train.py/evaluate.py). Must never be
+    the all-zero vector for a No Finding record, or the class would look
+    untrained and get no positive weight."""
     v = np.zeros(len(label_names), dtype=np.float32)
     if "No Finding" in record_labels:
+        if "No Finding" in label_names:
+            v[label_names.index("No Finding")] = 1.0
         return v
     for lab in record_labels:
         if lab in label_names:
@@ -154,6 +161,73 @@ def count_positives(records: list, label_names: List[str]) -> dict:
     for r in records:
         pos += labels_to_vector(r["labels"], label_names).astype(int)
     return {lab: int(cnt) for lab, cnt in zip(label_names, pos)}
+
+
+def available_classes(records: list, label_names: List[str], unavailable: List[str] = None) -> Tuple[List[str], List[str]]:
+    """Partition label_names into (trained, untrained) based on declared
+    unavailable_classes and observed positive counts. A class with zero
+    positives in the whole dataset has no training signal — reporting it as
+    trained would be dishonest."""
+    declared = set(unavailable or [])
+    pos = count_positives(records, label_names)
+    trained, untrained = [], []
+    for lab in label_names:
+        if lab in declared or pos[lab] == 0:
+            untrained.append(lab)
+        else:
+            trained.append(lab)
+    return trained, untrained
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def write_split_csv(records: list, path: str):
+    """Persist a partition as (Image Index, Finding Labels, Patient ID) CSV.
+    Image Index is stored as-is — ingestion tools write paths relative to the
+    project root so the same splits load on any machine/checkout.
+    Train/val/test splits are written by prepare_dataset.py / ingest_multi.py so
+    that train, threshold-selection, and evaluation all consume the SAME
+    patient-level partitions — reproducible and leakage-free."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Image Index", "Finding Labels", "Patient ID", "Dataset Source"])
+        for r in records:
+            writer.writerow([r["image_path"].replace("\\", "/"), "|".join(r["labels"]), r["patient_id"],
+                             r.get("dataset_source") or ""])
+
+
+def load_split_csv(path: str, images_dir: str = "") -> list:
+    """Load a persisted partition back into record dicts. Resolution order:
+      1. absolute path, 2. path relative to the project root (multi-source
+      ingestion), 3. images_dir + basename (flat NIH layout).
+    Returns [] when the file does not exist. Carries the optional Dataset
+    Source column for provenance."""
+    if not os.path.exists(path):
+        return []
+    records = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            img = (row.get("Image Index") or "").strip()
+            if not img:
+                continue
+            img = img.replace("\\", "/")
+            if os.path.isabs(img):
+                resolved = img
+            else:
+                resolved = os.path.join(PROJECT_ROOT, img)
+                if not os.path.exists(resolved) and images_dir:
+                    resolved = os.path.join(images_dir, os.path.basename(img))
+            raw = [l.strip() for l in (row.get("Finding Labels") or "No Finding").split("|") if l.strip()]
+            records.append({
+                "image_path": resolved,
+                "labels": raw,
+                "patient_id": (row.get("Patient ID") or f"anon_{len(records)}").strip(),
+                "dataset_source": (row.get("Dataset Source") or "").strip() or None,
+            })
+    return records
 
 
 def make_loaders(records_train, records_val, label_names, batch_size, input_size=224, num_workers=0):

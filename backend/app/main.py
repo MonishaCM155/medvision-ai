@@ -153,23 +153,25 @@ class ValidateResponse(BaseModel):
 _ENGINE = None
 
 
-def get_engine():
-    """Lazily initialize the PyTorch engine. Returns None when torch is missing."""
-    global _ENGINE
-    if _ENGINE is not None:
-        return _ENGINE
-
+def _build_engine(ckpt_dir=None):
+    """Create a fresh engine instance. ckpt_dir defaults to training/checkpoints.
+    Kept separate from get_engine() so tests can build engines against temp
+    checkpoint directories without touching the cached global."""
     try:
         import torch
         import torchvision.models as tvm
 
         checkpoint_path = None
-        ckpt_dir = os.path.join(os.path.dirname(__file__), "..", "..", "training", "checkpoints")
+        ckpt_dir = ckpt_dir or os.path.join(os.path.dirname(__file__), "..", "..", "training", "checkpoints")
         if os.path.isdir(ckpt_dir):
-            for f in sorted(os.listdir(ckpt_dir)):
-                if f.endswith((".pt", ".pth")):
-                    checkpoint_path = os.path.join(ckpt_dir, f)
-                    break
+            files = sorted(f for f in os.listdir(ckpt_dir) if f.endswith((".pt", ".pth")))
+            # Prefer best.pt (the training pipeline's selection); fall back to
+            # any other top-level checkpoint. Subdirectories (e.g. sanity/) are
+            # never scanned — only real runs write to the top level.
+            if "best.pt" in files:
+                files = ["best.pt"] + [f for f in files if f != "best.pt"]
+            if files:
+                checkpoint_path = os.path.join(ckpt_dir, files[0])
 
         # MEDVISION_SKIP_PRETRAINED=1 avoids the ~32MB ImageNet weight download
         # (used by the test suite, which validates contracts, not weights)
@@ -192,19 +194,33 @@ def get_engine():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
 
-        _ENGINE = {
+        # Checkpoint provenance: the training pipeline stores metadata alongside
+        # the weights (class order, dataset, validation-selected thresholds,
+        # unavailable classes, epoch, val AUROC, timestamp). Surface it honestly.
+        ckpt_meta = (state.get("metadata") or {}) if checkpoint_path and isinstance(state, dict) else {}
+        ckpt_info = {k: state.get(k) for k in ("epoch", "kind", "val_macro_auc", "timestamp")} if checkpoint_path and isinstance(state, dict) else {}
+        logger.info("PyTorch engine ready on %s (%s)", device, checkpoint_path or "pretrained backbone")
+        return {
             "torch": torch,
             "model": model,
             "device": device,
             "pytorch_version": torch.__version__,
             "checkpoint": checkpoint_path,
             "num_classes": num_classes,
+            "checkpoint_meta": ckpt_meta,
+            "checkpoint_info": ckpt_info,
         }
-        logger.info("PyTorch engine ready on %s (%s)", device, checkpoint_path or "pretrained backbone")
     except Exception as exc:  # torch missing or broken — run in demo mode
         logger.warning("PyTorch engine unavailable (%s) — falling back to demo profile", exc)
-        _ENGINE = None
+        return None
 
+
+def get_engine():
+    """Lazily initialize the PyTorch engine. Returns None when torch is missing."""
+    global _ENGINE
+    if _ENGINE is not None:
+        return _ENGINE
+    _ENGINE = _build_engine()
     return _ENGINE
 
 
@@ -228,7 +244,13 @@ def _engine_meta(engine) -> dict:
         mode, source, pred = "real-model", "pytorch-checkpoint", "real-inference"
     else:
         mode, source, pred = "backbone-live", "pytorch-backbone", "backbone+demo-profile"
-    return {
+    meta = engine.get("checkpoint_meta") or {}
+    info = engine.get("checkpoint_info") or {}
+    label_names = list(meta.get("label_names") or [])
+    unavailable = list(meta.get("unavailable_classes") or [])
+    trained = [l for l in label_names if l not in set(unavailable)] or None
+    ds = meta.get("dataset") or {}
+    base = {
         "engineMode": mode,
         "source": source,
         "modelName": "DenseNet-121 (CheXNet)",
@@ -239,6 +261,21 @@ def _engine_meta(engine) -> dict:
         "pytorchVersion": engine.get("pytorch_version"),
         "checkpoint": engine.get("checkpoint"),
     }
+    if engine.get("checkpoint"):
+        base.update({
+            "checkpointFile": os.path.basename(engine["checkpoint"]),
+            "checkpointKind": info.get("kind"),
+            "checkpointEpoch": info.get("epoch"),
+            "checkpointValMacroAuc": info.get("val_macro_auc"),
+            "trainingDate": info.get("timestamp"),
+            "dataset": ds.get("labels_csv") or None,
+            "imagesDir": ds.get("images_dir") or None,
+            "trainedClasses": trained,
+            "unavailableClasses": unavailable or None,
+            "thresholds": meta.get("thresholds") or None,
+            "thresholdPolicy": meta.get("threshold_policy") or "env-or-0.5",
+        })
+    return base
 
 
 def _quality_threshold() -> int:
@@ -341,28 +378,37 @@ def _validation_checks(m: Optional[dict], thr: dict) -> List[dict]:
     return checks
 
 
-def _class_thresholds() -> dict:
-    """Per-class decision thresholds. Global default 0.5; override per class
-    via the MEDVISION_CLASS_THRESHOLDS env var (JSON: label → threshold)."""
+def _class_thresholds(engine=None) -> dict:
+    """Per-class decision thresholds. Precedence:
+      1. MEDVISION_CLASS_THRESHOLDS env override (operator knob)
+      2. thresholds frozen into a fine-tuned checkpoint (validation-selected)
+      3. global 0.5 default
+    """
     import json as _json
 
     default = 0.5
+    base = {lab: default for lab in DISEASE_LABELS}
+    meta = (engine or {}).get("checkpoint_meta") or {}
+    ckpt_thr = meta.get("thresholds") or {}
+    if isinstance(ckpt_thr, dict):
+        for lab in DISEASE_LABELS:
+            try:
+                base[lab] = max(0.05, min(0.95, float(ckpt_thr.get(lab, default))))
+            except (TypeError, ValueError):
+                base[lab] = default
     raw = os.environ.get("MEDVISION_CLASS_THRESHOLDS", "")
     if raw:
         try:
             parsed = _json.loads(raw)
             if isinstance(parsed, dict):
-                out = {}
                 for k, v in parsed.items():
                     try:
-                        out[k] = max(0.05, min(0.95, float(v)))
+                        base[k] = max(0.05, min(0.95, float(v)))
                     except (TypeError, ValueError):
                         continue
-                if out:
-                    return {lab: out.get(lab, default) for lab in DISEASE_LABELS}
         except Exception:
-            logger.warning("MEDVISION_CLASS_THRESHOLDS is not valid JSON — using global 0.5 default")
-    return {lab: default for lab in DISEASE_LABELS}
+            logger.warning("MEDVISION_CLASS_THRESHOLDS is not valid JSON — using checkpoint/global defaults")
+    return {lab: base.get(lab, default) for lab in DISEASE_LABELS}
 
 
 def _profile_for_name(image_name: Optional[str]) -> dict:
@@ -662,22 +708,32 @@ def _build_prediction(image_name, image_data, model_name, clahe, noise_removal, 
             logger.warning("PyTorch forward pass failed (%s) — using demo profile", exc)
             torch_meta = None
 
-    thresholds = _class_thresholds()
+    thresholds = _class_thresholds(engine)
+    ckpt_meta = (engine or {}).get("checkpoint_meta") or {}
+    unavailable = set(ckpt_meta.get("unavailable_classes") or [])
     diseases = [
         {
             "disease": lab,
             "probability": round(probabilities[lab], 4),
             "threshold": thresholds[lab],
+            "trained": lab not in unavailable,
             "severityContribution": DISEASE_META[lab]["severityContribution"],
             "category": DISEASE_META[lab]["category"],
             "description": DISEASE_META[lab]["description"],
+            **({"note": "No training signal for this class in the checkpoint's dataset — probability is not a model finding."}
+               if lab in unavailable else {}),
         }
         for lab in DISEASE_LABELS
     ]
     diseases.sort(key=lambda d: d["probability"], reverse=True)
 
-    top = diseases[0]
-    severity_score = min(100, round(top["probability"] * 80 + (diseases[1]["probability"] if len(diseases) > 1 else 0) * 20))
+    # Top diagnosis / severity consider only classes the model was actually
+    # trained on (unavailable classes sit at ~0 probability anyway — this makes
+    # the exclusion explicit rather than accidental).
+    trained_sorted = [d for d in diseases if d["trained"]]
+    top = trained_sorted[0] if trained_sorted else diseases[0]
+    second = trained_sorted[1] if len(trained_sorted) > 1 else diseases[0]
+    severity_score = min(100, round(top["probability"] * 80 + second["probability"] * 20))
     if top["disease"] == "No Finding" or top["probability"] < 0.3:
         severity = "Low"
         severity_score = 5 if top["disease"] == "No Finding" else 15
@@ -690,7 +746,7 @@ def _build_prediction(image_name, image_data, model_name, clahe, noise_removal, 
     else:
         severity = "Low"
 
-    eff = diseases[1]["probability"] if len(diseases) > 1 else 0.0
+    eff = second["probability"]
     findings = [
         f"LUNGS: Focal airspace opacity noted with highest activation in {('bilateral peripheral' if top['disease'] == 'COVID-19' else 'right lower lung')} field.",
         f"PLEURA: {'Blunting of costophrenic angle present.' if eff > 0.3 else 'No significant pleural effusion or pneumothorax.'}",
@@ -839,7 +895,9 @@ def _build_prediction(image_name, image_data, model_name, clahe, noise_removal, 
         "thresholdPolicy": {
             "default": 0.5,
             "perClass": any(t != 0.5 for t in thresholds.values()),
-            "note": "Global 0.5 unless overridden per class via MEDVISION_CLASS_THRESHOLDS.",
+            "source": ("checkpoint (validation-selected)" if (engine or {}).get("checkpoint") and ckpt_meta.get("thresholds")
+                        else "env-override" if os.environ.get("MEDVISION_CLASS_THRESHOLDS") else "global-0.5"),
+            "note": "Fine-tuned checkpoints freeze validation-selected per-class thresholds; MEDVISION_CLASS_THRESHOLDS env overrides at runtime. The test set is never used to tune thresholds.",
         },
     }
 

@@ -35,9 +35,11 @@ import torchvision
 sys.path.insert(0, os.path.dirname(__file__))
 
 from dataset import (  # noqa: E402
-    DEFAULT_LABELS, ChestXrayDataset, compute_pos_weight, count_positives,
-    get_transform, load_nih_csv, make_synthetic_dataset, patient_split,
+    DEFAULT_LABELS, ChestXrayDataset, available_classes, compute_pos_weight,
+    count_positives, get_transform, load_nih_csv, load_split_csv,
+    make_synthetic_dataset, patient_split,
 )
+from thresholds import select_thresholds  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +191,8 @@ def evaluate(model, loader, device, amp=True):
     return val_loss, macro_auc(torch.sigmoid(scores), labels)
 
 
-def save_checkpoint(path, model, optimizer, epoch, val_auc, cfg, kind):
-    torch.save({
+def save_checkpoint(path, model, optimizer, epoch, val_auc, cfg, kind, metadata=None):
+    payload = {
         "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
         "optimizer": optimizer.state_dict() if optimizer else None,
         "epoch": epoch,
@@ -198,7 +200,10 @@ def save_checkpoint(path, model, optimizer, epoch, val_auc, cfg, kind):
         "config": cfg,
         "kind": kind,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }, path)
+    }
+    if metadata:
+        payload["metadata"] = metadata
+    torch.save(payload, path)
     print(f"[checkpoint] saved {kind} → {path}")
 
 
@@ -249,37 +254,59 @@ def main():
     # ------------------------------------------------------------------
     images_dir = (args.synthetic_sanity and args.images_dir) or ds.get("images_dir")
     labels_csv = (args.synthetic_sanity and args.labels_csv) or ds.get("labels_csv")
+    splits_dir = os.path.abspath(str(ds.get("splits_dir") or "training/splits"))
 
-    if args.synthetic_sanity or (images_dir and labels_csv and os.path.exists(str(labels_csv))):
-        if args.synthetic_sanity:
-            sanity_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "sanity")
-            os.makedirs(sanity_dir, exist_ok=True)
-            csv_path, records = make_synthetic_dataset(os.path.join(sanity_dir, "data"))
-            labels_csv, images_dir = csv_path, os.path.dirname(csv_path)
-            ckpt_dir = os.path.join(sanity_dir, "runs")
-            epochs = int(tr.get("epochs", 50))
-            if args.epochs is None:
-                epochs = 2  # sanity: 2 epochs is enough to prove the loop
-            print("[data] SYNTHETIC SANITY MODE — tiny synthetic dataset, pipeline validation only.")
-            label_alias = {}
-        else:
-            records, _, skipped = load_nih_csv(str(labels_csv), str(images_dir), label_names, ds.get("label_alias") or {})
-            ckpt_dir = str(tr.get("checkpoint_dir") or "training/checkpoints")
-            epochs = int(tr.get("epochs", 50))
-            label_alias = ds.get("label_alias") or {}
-            if skipped:
-                print(f"[data] skipped {skipped} records with only out-of-vocabulary findings")
+    # Reproducible patient-level splits on disk (multi-source ingest or NIH
+    # prepare_dataset.py) are the canonical data source. NIH-format CSV
+    # derivation is the fallback; synthetic sanity validates the loop.
+    train_records = load_split_csv(os.path.join(splits_dir, "train.csv"))
+    val_records = load_split_csv(os.path.join(splits_dir, "val.csv"))
+    _test_records = load_split_csv(os.path.join(splits_dir, "test.csv"))
+
+    if args.synthetic_sanity:
+        sanity_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "sanity")
+        os.makedirs(sanity_dir, exist_ok=True)
+        csv_path, records = make_synthetic_dataset(os.path.join(sanity_dir, "data"))
+        labels_csv, images_dir = csv_path, os.path.dirname(csv_path)
+        ckpt_dir = os.path.join(sanity_dir, "runs")
+        epochs = int(tr.get("epochs", 50))
+        if args.epochs is None:
+            epochs = 2  # sanity: 2 epochs is enough to prove the loop
+        print("[data] SYNTHETIC SANITY MODE — tiny synthetic dataset, pipeline validation only.")
+        label_alias = {}
+        train_records, val_records, _test_records = patient_split(
+            records, float(ds.get("train_frac", 0.8)), float(ds.get("val_frac", 0.1)), seed=seed)
+    elif train_records:
+        records = train_records + val_records + _test_records
+        ckpt_dir = str(tr.get("checkpoint_dir") or "training/checkpoints")
+        epochs = int(tr.get("epochs", 50))
+        label_alias = ds.get("label_alias") or {}
+        print(f"[data] loaded reproducible patient-level splits from {splits_dir}")
+    elif images_dir and labels_csv and os.path.exists(str(labels_csv)):
+        # Fallback: derive patient-level splits directly from an NIH-format CSV.
+        records, _, skipped = load_nih_csv(str(labels_csv), str(images_dir), label_names, ds.get("label_alias") or {})
+        ckpt_dir = str(tr.get("checkpoint_dir") or "training/checkpoints")
+        epochs = int(tr.get("epochs", 50))
+        label_alias = ds.get("label_alias") or {}
+        if skipped:
+            print(f"[data] skipped {skipped} records with only out-of-vocabulary findings")
+        train_records, val_records, _test_records = patient_split(
+            records, float(ds.get("train_frac", 0.8)), float(ds.get("val_frac", 0.1)), seed=seed)
+        print(f"[data] splits derived from CSV (patient-level, seed={seed})")
     else:
         print("\n[data] Training not executed because the required dataset is unavailable in the current environment.")
-        print("       Provide NIH ChestX-ray14 images + Data_Entry_2017.csv (see training/configs/train.yaml),")
+        print("       Run  python training/ingest_multi.py  after obtaining the datasets per docs/dataset-research.md,")
         print("       or run with --synthetic-sanity to validate the pipeline on a tiny synthetic dataset.\n")
         sys.exit(0)
 
-    train_records, val_records, _test_records = patient_split(
-        records, float(ds.get("train_frac", 0.8)), float(ds.get("val_frac", 0.1)), seed=seed
-    )
     print(f"[data] records: train={len(train_records)} val={len(val_records)}")
     print(f"[data] positives: {count_positives(records, label_names)}")
+
+    unavailable = list(ds.get("unavailable_classes") or [])
+    trained_classes, untrained_classes = available_classes(records, label_names, unavailable)
+    print(f"[labels] trained: {', '.join(trained_classes)}")
+    if untrained_classes:
+        print(f"[labels] unavailable (no training signal — kept at 0, never reported as findings): {', '.join(untrained_classes)}")
 
     batch_size = int(args.batch_size if args.batch_size else tr.get("batch_size", 32))
     input_size = int(ds.get("input_size", 224))
@@ -300,7 +327,8 @@ def main():
     # Model / loss / optimizer / scheduler
     # ------------------------------------------------------------------
     model = build_model(num_classes, bool(mod.get("pretrained", True)), device)
-    pw = compute_pos_weight(records, label_names, alpha=float(tr.get("pos_weight_alpha", 1.0)))
+    # Class weights from the TRAINING partition only (val/test never inform the loss).
+    pw = compute_pos_weight(train_records, label_names, alpha=float(tr.get("pos_weight_alpha", 1.0)))
     print(f"[loss] pos_weight = {[round(float(v), 2) for v in pw]}")
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw.to(device))
 
@@ -347,10 +375,28 @@ def main():
     # Training loop
     # ------------------------------------------------------------------
     os.makedirs(ckpt_dir, exist_ok=True)
+    if args.synthetic_sanity:
+        # Sanity artifacts stay inside the sanity dir — training/results/ must
+        # only ever contain artifacts from a real dataset run.
+        results_dir = os.path.join(os.path.dirname(ckpt_dir), "results")
+    else:
+        results_dir = str(tr.get("results_dir") or "training/results")
+    os.makedirs(results_dir, exist_ok=True)
+    ckpt_meta = {
+        "label_names": list(label_names),
+        "label_alias": label_alias,
+        "unavailable_classes": list(untrained_classes),
+        "trained_classes": list(trained_classes),
+        "dataset": {"labels_csv": str(labels_csv), "images_dir": str(images_dir),
+                    "splits_dir": str(splits_dir)},
+        "threshold_policy": str(tr.get("threshold_policy", "validate-max-f1")),
+        "seed": seed,
+    }
     run_meta = {
         "experiment": exp.get("name", "densenet121-chestxray"),
         "seed": seed, "device": device, "dataset": str(labels_csv),
         "label_names": label_names, "num_classes": num_classes,
+        "trained_classes": trained_classes, "unavailable_classes": untrained_classes,
         "epochs": epochs, "batch_size": batch_size, "lr": lr,
         "optimizer": str(tr.get("optimizer", "adam")), "scheduler": scheduler_name,
         "pos_weight": [round(float(v), 3) for v in pw],
@@ -378,10 +424,10 @@ def main():
         if improved:
             best_auc = val_auc
             stale = 0
-            save_checkpoint(os.path.join(ckpt_dir, "best.pt"), model, optimizer, epoch, val_auc, cfg, "best")
+            save_checkpoint(os.path.join(ckpt_dir, "best.pt"), model, optimizer, epoch, val_auc, cfg, "best", ckpt_meta)
         else:
             stale += 1
-        save_checkpoint(os.path.join(ckpt_dir, "last.pt"), model, optimizer, epoch, val_auc, cfg, "last")
+        save_checkpoint(os.path.join(ckpt_dir, "last.pt"), model, optimizer, epoch, val_auc, cfg, "last", ckpt_meta)
         with open(os.path.join(ckpt_dir, "experiment.json"), "w", encoding="utf-8") as f:
             json.dump(run_meta, f, indent=2)
 
@@ -395,7 +441,69 @@ def main():
     run_meta["best_val_macro_auc"] = round(best_auc, 4) if best_auc != float("-inf") else None
     with open(os.path.join(ckpt_dir, "experiment.json"), "w", encoding="utf-8") as f:
         json.dump(run_meta, f, indent=2)
+
+    # ------------------------------------------------------------------
+    # Per-class decision thresholds — validation set ONLY (never the test set)
+    # ------------------------------------------------------------------
+    thresholds = None
+    if str(tr.get("threshold_policy", "validate-max-f1")) == "validate-max-f1" and val_records:
+        print("[thresholds] selecting per-class F1-max thresholds on the VALIDATION set only ...")
+        thresholds, thr_meta = select_thresholds(model, val_records, label_names,
+                                                 input_size=input_size, batch_size=batch_size, device=device)
+        print(f"[thresholds] {json.dumps(thresholds)}")
+        for lab in untrained_classes:
+            thr_meta["per_class"][lab]["note"] = "unavailable class — threshold is inert (never reported)"
+        # Freeze thresholds into both checkpoints so the engine uses them.
+        for fn in ("best.pt", "last.pt"):
+            p = os.path.join(ckpt_dir, fn)
+            if os.path.exists(p):
+                c = torch.load(p, map_location="cpu")
+                c.setdefault("metadata", {}).update({"thresholds": thresholds, "threshold_meta": thr_meta})
+                torch.save(c, p)
+        with open(os.path.join(results_dir, "thresholds.json"), "w", encoding="utf-8") as f:
+            json.dump({"thresholds": thresholds, "meta": thr_meta}, f, indent=2)
+    else:
+        print("[thresholds] keeping global 0.5 per class (threshold_policy != validate-max-f1)")
+
+    # ------------------------------------------------------------------
+    # training/results/ artifacts (machine-readable)
+    # ------------------------------------------------------------------
+    with open(os.path.join(results_dir, "training_history.json"), "w", encoding="utf-8") as f:
+        json.dump(run_meta["epochs_log"], f, indent=2)
+    with open(os.path.join(results_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "status": "executed",
+            "experiment": run_meta["experiment"], "device": device,
+            "best_val_macro_auc": run_meta["best_val_macro_auc"],
+            "threshold_policy": str(tr.get("threshold_policy", "validate-max-f1")),
+            "thresholds": thresholds,
+            "started_at": run_meta["started_at"], "finished_at": run_meta["finished_at"],
+            "note": "Validation metrics only — test-set metrics are produced by "
+                    "training/evaluate.py on the held-out test partition.",
+        }, f, indent=2)
+    try:
+        import yaml
+        with open(os.path.join(results_dir, "config_used.yaml"), "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False)
+    except Exception as exc:
+        print(f"[results] config_used.yaml skipped ({exc})")
+    # Validation classification report (labeled clearly — NOT a test report).
+    if thresholds is not None:
+        from dataset import labels_to_vector
+        vec = np.asarray([labels_to_vector(r["labels"], label_names) for r in val_records])
+        val_report = {"partition": "validation",
+                      "note": "Class statistics at frozen thresholds on the validation partition. "
+                              "Test-set classification report: run training/evaluate.py.",
+                      "per_class": {}}
+        for c, lab in enumerate(label_names):
+            val_report["per_class"][lab] = {"frozen_threshold": thresholds[lab],
+                                             "val_positives": int(vec[:, c].sum()),
+                                             "val_negatives": int(len(val_records) - vec[:, c].sum())}
+        with open(os.path.join(results_dir, "val_classification_report.json"), "w", encoding="utf-8") as f:
+            json.dump(val_report, f, indent=2)
+
     print(f"[done] best val macro-AUROC: {best_auc if best_auc != float('-inf') else 'n/a'} → {ckpt_dir}")
+    print(f"[done] artifacts → {os.path.abspath(results_dir)}/")
 
 
 if __name__ == "__main__":

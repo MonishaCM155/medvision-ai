@@ -126,11 +126,11 @@ DISEASE DETECTOR → EXPLAINABILITY → CALIBRATION → UNCERTAINTY → REPORT
 |---|---|
 | `tsc --noEmit` (lint) | ✅ Pass (exit 0) |
 | `npm run build` (vite + server bundle) | ✅ Pass |
-| Python API tests (`pytest tests/test_api.py`) | ✅ 19/19 pass (health, engine, predict, validate, safety gate, CORS, explainability, similar-cases) |
+| Python API tests (`pytest tests/`) | ✅ 25/25 pass (health, engine, predict, validate, safety gate, CORS, explainability, similar-cases, **checkpoint provenance integration**) |
 | End-to-end engine smoke (`tests/e2e_smoke.py`) | ✅ 20/20 (engine → health → validation → prediction → explainability → report → similar-cases) |
 | API smoke tests (`tests/smoke-api.mjs`) | 23 scenario groups — requires running server |
-| CI (`.github/workflows/ci.yml`) | lint + build + pytest + e2e smoke on push/PR to `main`/`dev` |
-| Training pipeline (`--synthetic-sanity`) | ✅ Runs end-to-end on CPU (device detection, split, class weights, checkpointing) |
+| CI (`.github/workflows/ci.yml`) | lint + build + full `pytest tests/` + e2e smoke on push/PR to `main`/`dev` |
+| Training pipeline (`--synthetic-sanity` + NIH-format smoke) | ✅ Runs end-to-end on CPU (device detection, patient-level split, class weights, thresholds, checkpointing, results artifacts) |
 
 ---
 
@@ -157,14 +157,18 @@ DISEASE DETECTOR → EXPLAINABILITY → CALIBRATION → UNCERTAINTY → REPORT
 **Changes made in this hardening pass**
 1. **Real explainability wired end-to-end** — Grad-CAM / Grad-CAM++ (fine-tuned head) or class-agnostic feature activation (backbone) now run inside the FastAPI engine; `/api/predict` returns real `heatmapUrl` / `heatmapOverlayUrl` data-URLs, a genuine peak-region bounding box with thoracic-zone label, and `explainability` metadata. Simulated UI methods are clearly labelled.
 2. **Structured server-side validation** — `/api/validate` and every prediction return a `checks[]` report (PASS/WARN/FAIL) for format/resolution/grayscale/contrast/brightness/sharpness/orientation/chest_xray, with env-configurable thresholds.
-3. **Real training pipeline** — `training/train.py` now trains (config, patient-level split, class weights, schedulers, early stopping, checkpoints, resume, CUDA/MPS/CPU detection), `training/evaluate.py` computes AUROC/AUPRC/precision/recall/F1/specificity/ECE + plots, and `--synthetic-sanity` validates the loop without real data. **No checkpoint ships and none is claimed.**
+3. **Real training pipeline** — `training/train.py` trains (config, patient-level split, class weights, schedulers, early stopping, checkpoints, resume, CUDA/MPS/CPU detection), `training/evaluate.py` computes AUROC/AUPRC/precision/recall/F1/specificity/ECE + plots, and `--synthetic-sanity` validates the loop without real data. **No checkpoint ships and none is claimed.**
+8. **Transparent label mapping** — NIH ChestXray14 → project classes is explicit in `training/configs/train.yaml` and `training/prepare_dataset.py`: `Lung Opacity` ← `Consolidation` ∪ `Infiltration` (CheXpert-style merge), and `COVID-19` / `Tuberculosis` are marked **unavailable** (not in NIH ChestXray14) — never trained, never reported as findings. Out-of-vocabulary-only records (e.g. `Hernia`) are skipped so they can never teach a wrong "No Finding".
+9. **Validation-set thresholds** — per-class decision thresholds are selected on the **validation partition only** (max-F1 sweep), frozen into `best.pt` metadata + `training/results/thresholds.json`, and applied automatically by the engine (env override still wins). Test-set threshold tuning was removed — the test optimum is now reported descriptively only.
+10. **Checkpoint provenance in the engine** — the loader prefers `best.pt`, reads the training metadata (class order, dataset, trained/unavailable classes, frozen thresholds, epoch, val AUROC, training date) and exposes it via `/api/engine` and every prediction: `engineMode: real-model`, `checkpointFile`, `trainedClasses`, `unavailableClasses`, `thresholds`, `thresholdPolicy`. Predictions flag untrained classes `trained: false` and exclude them from top-diagnosis selection. A `No Finding` label-vector bug that would have mislabeled the class as untrained was found and fixed.
+11. **Dataset preparation + prediction tools** — `training/prepare_dataset.py` validates an NIH download, reports patients/images/positives/negatives/imbalance, and writes reproducible patient-level splits (`training/splits/`); `training/select_thresholds.py` and `training/predict_demo.py` (held-out images → sigmoid → thresholds → labels → Grad-CAM overlays) complete the loop. All tools report honestly when data is absent.
 4. **Real similar-case retrieval** — `/api/similar-cases` computes genuine DenseNet-121 feature embeddings + cosine similarity (engine online); the UI falls back to clearly-labelled demo similarities offline.
 5. **No fabricated patient data** — demo reports use `PAT-DEMO-*` ids; age/sex display "n/a" instead of invented 52/M; the copilot fallback no longer invents prior-baseline or interval-change numbers.
 6. **Honesty fixes** — DICOM parsing claims removed (PNG/JPEG/WebP only), model AUROC values labelled published-reference, engine-offline note corrected, Gemini model id env-configurable.
 7. **CI + tests** — pytest runs (19/19), `tests/e2e_smoke.py` added (20/20), `.gitignore` covers `artifacts/` and `training/checkpoints/`.
 
 **Remaining opportunities**
-1. **Fine-tuned checkpoint** — obtain NIH ChestX-ray14 (or CheXpert) legitimately, train with `training/train.py`, place the checkpoint under `training/checkpoints/`; the engine then runs full real inference with disease-specific Grad-CAM.
+1. **Fine-tuned checkpoint (training NOT executed — dataset absent)** — NIH ChestX-ray14 was not found anywhere in this environment and cannot be auto-downloaded. To complete real training: (a) download `Data_Entry_2017.csv` + `images_001..012.zip` from https://nihcc.app.box.com/v/ChestXray-NIHCC (~42 GB, public research access), (b) `python training/prepare_dataset.py --check-images`, (c) `python training/train.py --config training/configs/train.yaml`, (d) `python training/select_thresholds.py --checkpoint training/checkpoints/best.pt`. The engine then automatically runs `engineMode: real-model` with disease-specific Grad-CAM and the frozen validation thresholds. Until then, `/api/engine` honestly reports `backbone-live` (ImageNet backbone, demo probability profile) — never `fine-tuned`.
 2. **CI server smoke** — start the dev server in CI and run `npm run test:api` (currently requires a running server).
 3. **Version pinning** — package.json uses caret ranges; pin exact versions for fully reproducible production builds.
 

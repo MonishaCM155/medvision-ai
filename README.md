@@ -107,23 +107,52 @@ multi-label head, patient-level split, augmentation, class weighting, cosine
 scheduling, early stopping, checkpoints, resume, device auto-detection
 CUDA → MPS → CPU).
 
+**Label mapping (NIH ChestX-ray14 → project classes, fully transparent):**
+`No Finding`, `Pneumonia`, `Cardiomegaly`, `Pleural Effusion` (← NIH
+`Effusion`), `Edema`, `Atelectasis`, `Pneumothorax` and `Lung Opacity` (← NIH
+`Consolidation` ∪ `Infiltration`) are trainable. `COVID-19` and
+`Tuberculosis` are **not present in NIH ChestXray14** (2017 dataset; TB is a
+separate NIH collection) — they are marked **unavailable**, keep a head slot
+for the API contract, and are never reported as model findings.
+
 ```bash
-# Train on NIH ChestX-ray14 (edit training/configs/train.yaml first)
+# 1. Obtain NIH ChestX-ray14 (https://nihcc.app.box.com/v/ChestXray-NIHCC):
+#    Data_Entry_2017.csv + images/ extracted from images_001..012.zip (~42 GB)
+
+# 2. Validate layout, print per-class statistics, write reproducible
+#    patient-level train/val/test splits (no patient appears in two partitions)
+python training/prepare_dataset.py --check-images
+
+# 3. Train (uses the persisted splits; --synthetic-sanity validates the loop
+#    on a tiny synthetic dataset with no real data needed)
 python training/train.py --config training/configs/train.yaml
 
-# Validate the whole pipeline on a tiny synthetic dataset (no data required)
-python training/train.py --config training/configs/train.yaml --synthetic-sanity
+# 4. Per-class decision thresholds are selected on the VALIDATION set only
+#    (max-F1) and frozen into best.pt automatically. To re-run standalone:
+python training/select_thresholds.py --checkpoint training/checkpoints/best.pt
 
-# Evaluate a checkpoint on the patient-level test split
+# 5. Evaluate on the held-out test split (AUROC/AUPRC/precision/recall/F1/
+#    specificity/ECE + ROC/PR/calibration plots → artifacts/evaluation/ and
+#    training/results/classification_report.json)
 python training/evaluate.py --checkpoint training/checkpoints/best.pt \
     --config training/configs/train.yaml
+
+# 6. Inspect real predictions + Grad-CAM overlays on held-out images
+python training/predict_demo.py --checkpoint training/checkpoints/best.pt
 ```
 
-If the dataset is not present, `train.py` reports honestly
-("Training not executed because the required dataset is unavailable...")
-rather than pretending. The inference engine scans `training/checkpoints/*.pt`
-and switches to **full real inference** when it finds a fine-tuned 10/14-class
-head (see README-SUITE §8 for the three-tier honesty chain).
+If the dataset is not present, every script reports honestly ("...not
+executed because the required dataset and/or checkpoint are unavailable")
+rather than pretending. **No checkpoint ships and none is claimed.**
+
+The inference engine scans `training/checkpoints/` (preferring `best.pt`) and
+switches to **full real inference** when it finds a fine-tuned 10/14-class
+head, loading the checkpoint's provenance metadata — dataset, trained vs
+unavailable classes, frozen validation-selected thresholds, epoch, val AUROC,
+training date — and exposing it through `/api/engine` and every `/api/predict`
+response (`engineMode: real-model`, `checkpointFile`, `trainedClasses`, …).
+See README-SUITE §8 for the three-tier honesty chain (fine-tuned →
+backbone-live → demo).
 
 ---
 

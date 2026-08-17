@@ -196,14 +196,24 @@ def main():
         sys.exit(0)
     print(f"[data] test records: {len(test_records)}")
 
-    # Load checkpoint
+    # Load checkpoint (including metadata: class order, frozen thresholds,
+    # unavailable classes). Thresholds were selected on the VALIDATION set by
+    # train.py / select_thresholds.py — the test set never tunes thresholds.
     ckpt = torch.load(str(checkpoint), map_location="cpu")
     sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     sd = {k.replace("module.", ""): v for k, v in sd.items()}
     num_classes = sd["classifier.weight"].shape[0] if "classifier.weight" in sd else int(mod.get("num_classes", len(label_names)))
-    if num_classes != len(label_names):
-        label_names = label_names[:num_classes] if num_classes < len(label_names) else label_names
+    meta = ckpt.get("metadata") or {}
+    if meta.get("label_names"):
+        label_names = list(meta["label_names"])
+    if num_classes < len(label_names):
+        label_names = label_names[:num_classes]
+    frozen_thresholds = meta.get("thresholds") or {lab: 0.5 for lab in label_names}
+    unavailable = set(meta.get("unavailable_classes") or [])
     print(f"[model] checkpoint {checkpoint} · classes={num_classes} · epoch={ckpt.get('epoch')} · kind={ckpt.get('kind')}")
+    if unavailable:
+        print(f"[model] unavailable classes (excluded from macro metrics): {sorted(unavailable)}")
+    print(f"[model] frozen thresholds (validation-selected): {json.dumps(frozen_thresholds)}")
 
     model = torchvision.models.densenet121(weights=None)
     model.classifier = nn.Linear(model.classifier.in_features, num_classes)
@@ -227,31 +237,35 @@ def main():
     scores = np.concatenate(all_scores)
     labels = np.concatenate(all_labels)
 
-    # Per-class metrics
+    # Per-class metrics. Operating metrics use the FROZEN validation-selected
+    # threshold; the test-derived F1 optimum is reported descriptively only and
+    # is never used as an operating threshold.
     per_class = {}
-    aucs = []
     for c, lab in enumerate(label_names):
         s, l = scores[:, c], labels[:, c]
         auroc = auc_from_scores(s, l)
         auprc, _, _ = pr_curve(s, l)
-        aucs.append(auroc)
-        # Best-F1 threshold sweep
+        thr = float(frozen_thresholds.get(lab, 0.5))
+        at_thr = binary_metrics(s, l, threshold=thr)
+        # Descriptive test-set optimum (NOT an operating threshold).
         best_t, best_f1 = 0.5, -1.0
         for t in np.linspace(0.05, 0.95, 19):
             m = binary_metrics(s, l, threshold=float(t))
             if m["f1"] > best_f1:
                 best_t, best_f1 = float(t), m["f1"]
-        m50 = binary_metrics(s, l, threshold=0.5)
         per_class[lab] = {
             "auroc": round(auroc, 4) if auroc == auroc else None,
             "auprc": round(auprc, 4),
-            "at_0.5": m50,
-            "best_f1_threshold": round(best_t, 4),
-            "best_f1": round(best_f1, 4),
+            "frozen_threshold": thr,
+            "at_frozen_threshold": at_thr,
+            "test_descriptive_opt_f1_threshold": round(best_t, 4),
+            "test_descriptive_opt_f1": round(best_f1, 4),
             "positives": int(l.sum()),
+            "unavailable": lab in unavailable,
         }
 
-    valid = [per_class[lab]["auroc"] for lab in label_names if per_class[lab]["auroc"] is not None]
+    valid = [per_class[lab]["auroc"] for lab in label_names
+             if per_class[lab]["auroc"] is not None and not per_class[lab]["unavailable"]]
     macro_auroc = float(np.mean(valid)) if valid else None
     # Micro AUROC: pool all scores/labels
     micro_auroc = auc_from_scores(scores.ravel(), labels.ravel())
@@ -274,10 +288,31 @@ def main():
     with open(os.path.join(args.out, "evaluation_report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
-    # Threshold analysis JSON
+    # Threshold analysis JSON — frozen (validation-selected) operating thresholds
+    # + descriptive test-set optimum (clearly labeled, never used for operating).
     with open(os.path.join(args.out, "threshold_analysis.json"), "w", encoding="utf-8") as f:
-        json.dump({lab: {"best_f1_threshold": per_class[lab]["best_f1_threshold"],
-                         "best_f1": per_class[lab]["best_f1"]} for lab in label_names}, f, indent=2)
+        json.dump({lab: {"frozen_threshold": per_class[lab]["frozen_threshold"],
+                         "at_frozen_threshold": per_class[lab]["at_frozen_threshold"],
+                         "test_descriptive_opt_f1_threshold": per_class[lab]["test_descriptive_opt_f1_threshold"],
+                         "note": "Operating threshold frozen from the validation set; the test-set optimum is descriptive only."}
+                   for lab in label_names}, f, indent=2)
+
+    # Test-set classification report → training/results/ (STEP 6 artifact list).
+    results_dir = str(cfg.get("training", {}).get("results_dir") or "training/results")
+    os.makedirs(results_dir, exist_ok=True)
+    with open(os.path.join(results_dir, "classification_report.json"), "w", encoding="utf-8") as f:
+        json.dump({"partition": "test", "status": "executed", "checkpoint": str(checkpoint),
+                   "macro_auroc": round(macro_auroc, 4) if macro_auroc is not None else None,
+                   "per_class": {lab: {"precision": per_class[lab]["at_frozen_threshold"]["precision"],
+                                        "recall": per_class[lab]["at_frozen_threshold"]["recall"],
+                                        "sensitivity": per_class[lab]["at_frozen_threshold"]["sensitivity"],
+                                        "specificity": per_class[lab]["at_frozen_threshold"]["specificity"],
+                                        "f1": per_class[lab]["at_frozen_threshold"]["f1"],
+                                        "threshold": per_class[lab]["frozen_threshold"],
+                                        "unavailable": per_class[lab]["unavailable"]}
+                                  for lab in label_names},
+                   "generated_at": datetime.now(timezone.utc).isoformat()}, f, indent=2)
+    print(f"[out] test classification report → {os.path.join(results_dir, 'classification_report.json')}")
 
     # Plots (matplotlib — optional; evaluation still works without it)
     try:
@@ -321,12 +356,13 @@ def main():
     except Exception as exc:
         print(f"[plot] matplotlib unavailable or failed ({exc}) — plots skipped, JSON still written.")
 
-    print(f"\n[result] macro AUROC: {macro_auroc if macro_auroc is not None else 'n/a'} · "
+    print(f"\n[result] macro AUROC (trained classes): {macro_auroc if macro_auroc is not None else 'n/a'} · "
           f"micro AUROC: {micro_auroc:.4f} · ECE: {ece:.4f}")
     for lab in label_names:
         p = per_class[lab]
+        tag = " (unavailable)" if p["unavailable"] else ""
         print(f"  {lab:<18} AUROC {str(p['auroc']):>7}  AUPRC {p['auprc']:.3f}  "
-              f"F1@0.5 {p['at_0.5']['f1']:.3f}  F1@{p['best_f1_threshold']:.2f} {p['best_f1']:.3f}  n+ {p['positives']}")
+              f"F1@thr {p['at_frozen_threshold']['f1']:.3f}  n+ {p['positives']}{tag}")
     print(f"\n[out] saved to {os.path.abspath(args.out)}/")
 
 

@@ -265,16 +265,22 @@ Operational command center:
 A real, reproducible training pipeline ships in `training/`:
 
 ```bash
-python training/train.py --config training/configs/train.yaml          # train on NIH ChestX-ray14
-python training/train.py --config ... --synthetic-sanity               # validate pipeline, no data needed
+python training/prepare_dataset.py --check-images                    # validate NIH layout + write reproducible patient-level splits
+python training/train.py --config training/configs/train.yaml        # train on NIH ChestX-ray14
+python training/train.py --config ... --synthetic-sanity             # validate pipeline, no data needed
+python training/select_thresholds.py --checkpoint training/checkpoints/best.pt   # validation-set max-F1 thresholds
 python training/evaluate.py --checkpoint training/checkpoints/best.pt --config training/configs/train.yaml
+python training/predict_demo.py --checkpoint training/checkpoints/best.pt        # real predictions + Grad-CAM overlays
 ```
 
-- Patient-level train/val/test split, augmentation, inverse-frequency class weighting, cosine/step LR, early stopping, AMP (CUDA), best/last checkpoints, resume, experiment metadata JSON.
+- **Transparent label mapping**: `Lung Opacity` ← NIH `Consolidation` ∪ `Infiltration`; `COVID-19` / `Tuberculosis` marked **unavailable** (absent from NIH ChestXray14) — kept as head slots, never reported as findings.
+- Patient-level train/val/test split (persisted to `training/splits/` by `prepare_dataset.py`; no patient appears in two partitions), augmentation, inverse-frequency class weighting, cosine/step LR, early stopping, AMP (CUDA), best/last checkpoints, resume, experiment metadata JSON.
+- **Per-class decision thresholds are selected on the validation set only** (max-F1), frozen into `best.pt` metadata + `training/results/thresholds.json`; the test set is never used to tune thresholds.
 - Device auto-detection **CUDA → MPS → CPU** — CPU training works everywhere.
-- `evaluate.py` writes AUROC (per-class/macro/micro), AUPRC, precision/recall/F1, sensitivity/specificity, best-F1 thresholds and ECE calibration to `artifacts/evaluation/` (JSON + PNG plots).
-- If the dataset is absent, both scripts report honestly — **no fabricated metrics, no fake training**.
+- `evaluate.py` writes AUROC (per-class/macro/micro), AUPRC, precision/recall/F1, sensitivity/specificity, ECE calibration and plots to `artifacts/evaluation/`, plus the test classification report to `training/results/classification_report.json`. Checkpoint metadata (class order, dataset, frozen thresholds, unavailable classes, epoch, val AUROC) is read back so operating metrics use the exact thresholds the engine applies.
+- If the dataset/checkpoint is absent, every script reports honestly — **no fabricated metrics, no fake training**.
 - `--synthetic-sanity` writes to `training/checkpoints/sanity/` so sanity weights are never mistaken for real model weights by the engine.
+- **Checkpoint provenance in the engine**: when `training/checkpoints/best.pt` (or another `.pt`/`.pth`) exists with a 10/14-class head, `/api/engine` and every prediction report `engineMode: real-model`, `checkpointFile`, `dataset`, `trainedClasses` / `unavailableClasses`, `thresholds` and `thresholdPolicy` — the UI/API never present `backbone-live` as `fine-tuned`.
 
 ### 8b. AI Safety Pipeline (medically responsible by design)
 

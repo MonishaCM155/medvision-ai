@@ -1,38 +1,63 @@
 # ===========================================================================
 # MedVision AI — training configuration (default)
 #
-# Usage:
+# Primary workflow — real multi-source data (see docs/dataset-research.md):
+#   python training/ingest_multi.py              # build patient-level splits
 #   python training/train.py --config training/configs/train.yaml
-#   python training/train.py --config ... --epochs 20 --batch_size 32   # CLI overrides
-#   python training/train.py --config ... --synthetic-sanity            # validate the
-#       pipeline end-to-end on a tiny synthetic dataset (no real data needed)
+#   python training/select_thresholds.py --checkpoint training/checkpoints/best.pt
+#   python training/evaluate.py --checkpoint training/checkpoints/best.pt \
+#       --config training/configs/train.yaml
+#   python training/predict_demo.py --checkpoint training/checkpoints/best.pt
 #
-# The inference engine (backend/app/main.py) scans training/checkpoints/*.pt
-# and switches to full real inference when it finds a fine-tuned 10/14-class
-# head. NOTE: sanity checkpoints are written to training/checkpoints/sanity/
-# so they are never picked up as real weights.
+# Fallback (NIH ChestX-ray14 layout, no longer the primary path):
+#   python training/prepare_dataset.py --labels_csv ... --images_dir ...
+#   python training/train.py --config training/configs/train.yaml
+#
+# Pipeline validation without real data:
+#   python training/train.py --config ... --synthetic-sanity
+#
+# The inference engine (backend/app/main.py) scans training/checkpoints/ and
+# switches to full real inference when it finds a fine-tuned 10/14-class head.
+# NOTE: sanity checkpoints are written to training/checkpoints/sanity/ so they
+# are never picked up as real weights.
 # ===========================================================================
 
 experiment:
-  name: densenet121-chestxray
+  name: densenet121-multisource
   seed: 42
 
 dataset:
-  # NIH ChestX-ray14 layout: images_dir contains the PNG images; labels_csv is
-  # Data_Entry_2017.csv with columns Image Index / Finding Labels / Patient ID.
-  # (Patient-level split requires the Patient ID column.)
-  images_dir: ./datasets/nih_chestxray/images
-  labels_csv: ./datasets/nih_chestxray/Data_Entry_2017.csv
-  train_frac: 0.8
-  val_frac: 0.1
+  # Split CSVs (training/splits/*.csv) carry image paths relative to the
+  # project root; images_dir is only the base for the NIH-CSV fallback.
+  images_dir: .
+  labels_csv: ./datasets/nih_chestxray/Data_Entry_2017.csv   # NIH fallback only
+  splits_dir: training/splits
+  train_frac: 0.7
+  val_frac: 0.15
   input_size: 224
-  # NIH uses synonyms for some of the model labels — mapped here. NIH does not
-  # contain COVID-19 or Tuberculosis cases; those classes remain all-zero on
-  # NIH-only training (documented limitation, not a claim of coverage).
+  # Multi-source label mapping (documented in docs/label-mapping.md):
+  #   Tuberculosis  <- Shenzhen Hospital CXR (NLM): filename convention,
+  #                    readme-documented (_1 = abnormal/TB), 336 cases
+  #   COVID-19      <- Cohen et al. covid-chestxray-dataset (CC BY 4.0),
+  #                    finding contains COVID-19, modality X-ray
+  #   Pneumonia     <- Cohen et al. (viral/bacterial/fungal non-COVID),
+  #                    finding == "Pneumonia" or "Pneumonia/...", modality X-ray
+  #   No Finding    <- Shenzhen normal cases (_0) + Cohen "No Finding"
+  # NIH fallback alias (kept for the non-primary NIH flow):
   label_alias:
     Effusion: Pleural Effusion
-    Infiltration: Lung Opacity
     Consolidation: Lung Opacity
+    Infiltration: Lung Opacity
+  # Classes with no legitimate training signal in the current data mix. The
+  # head keeps a slot for them (engine contract) but they are flagged
+  # trained:false, get no probability, and are excluded from top-diagnosis.
+  unavailable_classes:
+    - Atelectasis
+    - Pleural Effusion
+    - Edema
+    - Cardiomegaly
+    - Pneumothorax
+    - Lung Opacity
 
 model:
   architecture: densenet121        # the only supported backbone
@@ -40,8 +65,8 @@ model:
   num_classes: 10                  # must match the engine's fine-tuned head
 
 training:
-  epochs: 50
-  batch_size: 32
+  epochs: 60
+  batch_size: 16
   lr: 0.0001
   weight_decay: 0.0001
   optimizer: adam                  # adam | sgd
@@ -50,10 +75,16 @@ training:
   step_size: 15                    # step scheduler only
   gamma: 0.1                       # step scheduler only
   amp: true                        # mixed precision (CUDA only; ignored on CPU)
-  early_stopping_patience: 8       # on validation macro-AUROC
+  early_stopping_patience: 10      # on validation macro-AUROC
   checkpoint_dir: training/checkpoints
+  results_dir: training/results
   resume: null                     # path to a checkpoint to resume from
   # Multiplier on inverse-frequency class weights for BCEWithLogitsLoss.
   # 0 disables class weighting; 1.0 = plain inverse-frequency; >1 over-weights
-  # rare positives (helps pneumonia/effusion; may destabilize). Clamped [0.1, 50].
+  # rare positives. Clamped [0.1, 50].
   pos_weight_alpha: 1.0
+  # Decision thresholds: "validate-max-f1" (default) selects per-class
+  # F1-maximizing thresholds on the VALIDATION set only, after training, and
+  # freezes them into best.pt metadata + training/results/thresholds.json.
+  # The test set is never used to tune thresholds. "0.5" keeps the global 0.5.
+  threshold_policy: validate-max-f1

@@ -38,9 +38,9 @@ jobs:
       run: |
         npm run build
 
-    - name: Run Python API Tests (FastAPI engine)
+    - name: Run Python API Tests (FastAPI engine + checkpoint integration)
       run: |
-        python -m pytest tests/test_api.py -q
+        python -m pytest tests/ -q
 
     - name: Run End-to-End Engine Smoke Test
       run: |
