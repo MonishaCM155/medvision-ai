@@ -417,7 +417,7 @@ def _profile_for_name(image_name: Optional[str]) -> dict:
         return DEMO_PROFILES["covid"]
     if "normal" in name or "clear" in name:
         return DEMO_PROFILES["normal"]
-    if "cardio" in name or "heart" in name or "cardio" in name or "cardiomeg" in name:
+    if "cardio" in name or "heart" in name or "cardiomeg" in name:
         return DEMO_PROFILES["cardio"]
     if "pneumo" in name or "lung" in name:
         return DEMO_PROFILES["default"]
