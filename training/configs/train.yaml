@@ -49,16 +49,10 @@ dataset:
     Effusion: Pleural Effusion
     Consolidation: Lung Opacity
     Infiltration: Lung Opacity
-  # Classes with no legitimate training signal in the current data mix. The
-  # head keeps a slot for them (engine contract) but they are flagged
-  # trained:false, get no probability, and are excluded from top-diagnosis.
-  unavailable_classes:
-    - Atelectasis
-    - Pleural Effusion
-    - Edema
-    - Cardiomegaly
-    - Pneumothorax
-    - Lung Opacity
+  # Classes with no legitimate training signal. When NIH ChestX-ray14 data
+  # is available (Data.csv + images), all 10 classes have training data.
+  # The dynamic detection in train.py overrides this based on actual positives.
+  unavailable_classes: []
 
 model:
   architecture: densenet121        # the only supported backbone

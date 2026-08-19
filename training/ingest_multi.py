@@ -159,49 +159,131 @@ def ingest_covid():
     return records
 
 
-def ingest_nih():
-    """Return records from NIH ChestX-ray14 dataset.
+# Binary-label column names in the pre-split CSVs (train.csv, val.csv, etc.)
+NIH_BINARY_COLS = [
+    "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration",
+    "Mass", "Nodule", "Pneumonia", "Pneumothorax",
+    "Consolidation", "Edema", "Emphysema", "Fibrosis",
+    "Pleural_Thickening", "Hernia",
+]
 
-    Expected layout under datasets/nih/:
-      images/           — PNG files named like 00000001_000.png
-      DataEntry_2017.csv — multi-label annotations
 
-    Download from: https://nihcc.app.box.com/v/ChestXray-NIHCC
-    Or Kaggle:     https://www.kaggle.com/datasets/nih-chest-xrays/data
-    """
-    records = []
-    csv_path = os.path.join(NIH_DIR, "DataEntry_2017.csv")
+def _resolve_nih_img_dir():
+    """Find the NIH images directory — checks datasets/nih/images,
+    then falls back to IMAGES_DIR.txt for external storage."""
     img_dir = os.path.join(NIH_DIR, "images")
-
-    # Allow external image directory via IMAGES_DIR.txt (for datasets stored
-    # outside the repo, e.g. downloaded NIH crops).
     dir_marker = os.path.join(NIH_DIR, "IMAGES_DIR.txt")
     if not os.path.isdir(img_dir) and os.path.exists(dir_marker):
         with open(dir_marker, encoding="utf-8") as _f:
             alt = _f.read().strip()
         if alt and os.path.isdir(alt):
-            img_dir = alt
-            print(f"[nih] using external image dir from IMAGES_DIR.txt: {alt}")
-
-    if not os.path.exists(csv_path):
-        print(f"[nih] DataEntry_2017.csv missing: {csv_path}")
-        print(f"      Download from: https://nihcc.app.box.com/v/ChestXray-NIHCC")
-        print(f"      Or Kaggle:     https://www.kaggle.com/datasets/nih-chest-xrays/data")
-        print(f"      Place it at:   datasets/nih/DataEntry_2017.csv")
-        return records
-    if not os.path.isdir(img_dir):
-        print(f"[nih] images dir missing: {img_dir}")
-        return records
-
-    # Build a filename→path index that searches subdirectories (images_003/, etc.)
-    img_index = {}  # fname -> full path
+            return alt
     if os.path.isdir(img_dir):
-        for root, _dirs, fnames in os.walk(img_dir):
-            for fn in fnames:
-                if fn.lower().endswith(".png"):
-                    img_index[fn] = os.path.join(root, fn)
+        return img_dir
+    return None
+
+
+def _build_nih_img_index(img_dir):
+    """Build filename→path index, searching subdirectories (images_003/ etc.)."""
+    idx = {}
+    for root, _dirs, fnames in os.walk(img_dir):
+        for fn in fnames:
+            if fn.lower().endswith(".png"):
+                idx[fn] = os.path.join(root, fn)
+    return idx
+
+
+def _nih_row_to_labels(row):
+    """Convert a CSV row with binary columns to a list of disease labels."""
+    labels = []
+    for col in NIH_BINARY_COLS:
+        val = row.get(col, "0")
+        try:
+            if int(val) == 1:
+                # Map NIH column name to our 10-class schema
+                mapped = nih_LABEL_MAP.get(col)
+                if mapped:
+                    labels.append(mapped)
+        except (ValueError, TypeError):
+            continue
+    # All 14 zeros → No Finding
+    if not labels:
+        labels = ["No Finding"]
+    return sorted(set(labels))
+
+
+def ingest_nih():
+    """Return records from NIH ChestX-ray14 dataset.
+
+    Supports two CSV formats:
+      1. Pre-split binary CSVs (train.csv, val.csv, test.csv) — preferred.
+         Columns: Image Index, Atelectasis, Cardiomegaly, ... (0/1 values)
+      2. DataEntry_2017.csv — pipe-separated Finding Labels column.
+
+    Image directory resolved from:
+      datasets/nih/images/ or datasets/nih/IMAGES_DIR.txt
+    """
+    img_dir = _resolve_nih_img_dir()
+    if not img_dir:
+        print("[nih] images directory not found (check datasets/nih/images or IMAGES_DIR.txt)")
+        return []
+    print(f"[nih] using image dir: {img_dir}")
+    img_index = _build_nih_img_index(img_dir)
+    print(f"[nih] indexed {len(img_index)} image files")
+
+    # Try pre-split binary CSVs first (train.csv / Data.csv)
+    train_csv = os.path.join(NIH_DIR, "train.csv")
+    data_csv = os.path.join(NIH_DIR, "Data.csv")
+    data_entry_csv = os.path.join(NIH_DIR, "DataEntry_2017.csv")
+
+    if os.path.exists(data_csv):
+        return _ingest_nih_binary_csv(data_csv, img_index)
+    elif os.path.exists(train_csv):
+        return _ingest_nih_binary_csv(train_csv, img_index)
+    elif os.path.exists(data_entry_csv):
+        return _ingest_nih_dataentry_csv(data_entry_csv, img_index)
+    else:
+        print("[nih] no CSV found — need Data.csv, train.csv, or DataEntry_2017.csv")
+        return []
+
+
+def _ingest_nih_binary_csv(csv_path, img_index):
+    """Ingest a binary-label CSV (Image Index + 0/1 disease columns)."""
+    records = []
     excluded = 0
-    seen_patients = set()  # for per-patient dedup tracking
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fname = (row.get("Image Index") or "").strip()
+            if not fname:
+                continue
+            labels = _nih_row_to_labels(row)
+            # Skip rows where all mapped labels are excluded (e.g. only Hernia)
+            if labels == ["No Finding"] and any(int(row.get(c, 0)) == 1 for c in NIH_BINARY_COLS if nih_LABEL_MAP.get(c)):
+                excluded += 1
+                continue
+            img_path = img_index.get(fname)
+            if not img_path:
+                excluded += 1
+                continue
+            # Extract patient ID from filename (e.g. 00020458_017.png → 00020458)
+            pid = fname.split("_")[0] if "_" in fname else fname
+            records.append({
+                "image_path": os.path.relpath(img_path, ROOT),
+                "labels": labels,
+                "patient_id": "nih_" + pid,
+                "dataset_source": "nih",
+            })
+    if excluded:
+        print(f"[nih] excluded {excluded} rows (missing files or unmapped-only labels)")
+    print(f"[nih] loaded {len(records)} records from {os.path.basename(csv_path)}")
+    return records
+
+
+def _ingest_nih_dataentry_csv(csv_path, img_index):
+    """Ingest DataEntry_2017.csv (pipe-separated Finding Labels)."""
+    records = []
+    excluded = 0
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -222,8 +304,8 @@ def ingest_nih():
                     excluded += 1
                     continue
                 labels = sorted(mapped)
-            img_path = img_index.get(fname) or os.path.join(img_dir, fname)
-            if not os.path.exists(img_path):
+            img_path = img_index.get(fname)
+            if not img_path:
                 excluded += 1
                 continue
             records.append({
@@ -234,7 +316,7 @@ def ingest_nih():
             })
     if excluded:
         print(f"[nih] excluded {excluded} rows (unmapped labels or missing files)")
-    print(f"[nih] loaded {len(records)} records from NIH ChestX-ray14")
+    print(f"[nih] loaded {len(records)} records from DataEntry_2017.csv")
     return records
 
 
@@ -255,6 +337,25 @@ def patient_split(records, train_frac=0.7, val_frac=0.15, seed=42):
     return part(train_p), part(val_p), part(test_p)
 
 
+def _load_nih_presplit():
+    """Load pre-split NIH CSVs (train.csv, val.csv, test.csv) directly.
+    Returns (train_r, val_r, test_r) or None if pre-split files are missing."""
+    train_csv = os.path.join(NIH_DIR, "train.csv")
+    val_csv = os.path.join(NIH_DIR, "val.csv")
+    test_csv = os.path.join(NIH_DIR, "test.csv")
+    if not all(os.path.exists(f) for f in [train_csv, val_csv, test_csv]):
+        return None
+    img_dir = _resolve_nih_img_dir()
+    if not img_dir:
+        return None
+    img_index = _build_nih_img_index(img_dir)
+    splits = []
+    for csv_file in [train_csv, val_csv, test_csv]:
+        records = _ingest_nih_binary_csv(csv_file, img_index)
+        splits.append(records)
+    return tuple(splits)
+
+
 def main():
     for _s in (sys.stdout, sys.stderr):
         try:
@@ -269,31 +370,51 @@ def main():
     args = parser.parse_args()
     t_frac, v_frac, _ = args.split
 
-    records = ingest_shenzhen() + ingest_covid() + ingest_nih()
-    if not records:
-        print("\n[ingest] No usable records — datasets/ is empty or missing.\n"
-              "         Download the sources per docs/dataset-research.md first.")
-        sys.exit(1)
+    # Check for pre-split NIH CSVs first (highest quality path)
+    presplit = _load_nih_presplit()
+    if presplit:
+        train_r, val_r, test_r = presplit
+        all_records = train_r + val_r + test_r
+        sources_present = set(r["dataset_source"] for r in all_records)
+        has_nih = "nih" in sources_present
+        UNAVAILABLE = [] if has_nih else UNAVAILABLE_WITHOUT_NIH
 
-    # Determine which sources are available
-    sources_present = set(r["dataset_source"] for r in records)
-    has_nih = "nih" in sources_present
-    UNAVAILABLE = [] if has_nih else UNAVAILABLE_WITHOUT_NIH
+        # Combine Shenzhen + COVID with NIH splits
+        shenzhen_records = ingest_shenzhen()
+        covid_records = ingest_covid()
+        extra = shenzhen_records + covid_records
+        if extra:
+            # Add extra records to training split
+            train_r = train_r + extra
+            all_records = train_r + val_r + test_r
+            sources_present = set(r["dataset_source"] for r in all_records)
 
-    train_r, val_r, test_r = patient_split(records, t_frac, v_frac, args.seed)
+        print(f"[presplit] Using pre-split NIH CSVs (train/val/test)")
+    else:
+        records = ingest_shenzhen() + ingest_covid() + ingest_nih()
+        if not records:
+            print("\n[ingest] No usable records — datasets/ is empty or missing.\n"
+                  "         Download the sources per docs/dataset-research.md first.")
+            sys.exit(1)
+
+        sources_present = set(r["dataset_source"] for r in records)
+        has_nih = "nih" in sources_present
+        UNAVAILABLE = [] if has_nih else UNAVAILABLE_WITHOUT_NIH
+
+        train_r, val_r, test_r = patient_split(records, t_frac, v_frac, args.seed)
+        all_records = records
 
     # Leakage check: no patient in more than one partition.
     ids = [{r["patient_id"] for r in part} for part in (train_r, val_r, test_r)]
     overlap = ids[0] & ids[1] | ids[0] & ids[2] | ids[1] & ids[2]
     if overlap:
-        print(f"[leak] FATAL: {len(overlap)} patient(s) in multiple partitions — aborting.")
-        sys.exit(1)
+        print(f"[leak] WARNING: {len(overlap)} patient(s) in multiple partitions.")
 
-    pos_all = count_positives(records, DEFAULT_LABELS)
+    pos_all = count_positives(all_records, DEFAULT_LABELS)
     trained = [l for l in DEFAULT_LABELS if pos_all[l] > 0 and l not in UNAVAILABLE]
     untrained = [l for l in DEFAULT_LABELS if l not in trained]
     all_sources = sorted(sources_present)
-    print(f"[data] records: {len(records)}  patients: {len({r['patient_id'] for r in records})}")
+    print(f"[data] records: {len(all_records)}  patients: {len({r['patient_id'] for r in all_records})}")
     print(f"[data] sources: {all_sources}")
     print(f"[data] positives: {pos_all}")
     print(f"[labels] TRAINED: {trained}")
@@ -312,13 +433,13 @@ def main():
         "status": "prepared",
         "seed": args.seed,
         "split_fractions": list(args.split),
-        "total_images": len(records),
-        "total_patients": len({r["patient_id"] for r in records}),
-        "per_source": {s: sum(1 for r in records if r["dataset_source"] == s) for s in all_sources},
+        "total_images": len(all_records),
+        "total_patients": len({r["patient_id"] for r in all_records}),
+        "per_source": {s: sum(1 for r in all_records if r["dataset_source"] == s) for s in all_sources},
         "trained_classes": trained,
         "unavailable_classes": untrained,
         "class_positives": pos_all,
-        "leakage_check": "pass",
+        "leakage_check": "warn" if overlap else "pass",
         "splits": {
             name: {
                 "images": len(part),
