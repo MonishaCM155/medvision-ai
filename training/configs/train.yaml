@@ -30,7 +30,8 @@ dataset:
   # Split CSVs (training/splits/*.csv) carry image paths relative to the
   # project root; images_dir is only the base for the NIH-CSV fallback.
   images_dir: .
-  labels_csv: ./datasets/nih_chestxray/Data_Entry_2017.csv   # NIH fallback only
+  # Multi-source dataset (Cohen + Shenzhen); splits from ingest_multi.py
+  labels_csv: ./datasets/covid19/metadata.csv  # fallback for NIH-path only (splits are canonical)
   splits_dir: training/splits
   train_frac: 0.7
   val_frac: 0.15

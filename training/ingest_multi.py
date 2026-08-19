@@ -52,11 +52,32 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SHENZHEN_DIR = os.path.join(ROOT, "datasets", "shenzhen")
 COVID_DIR = os.path.join(ROOT, "datasets", "covid19")
+NIH_DIR = os.path.join(ROOT, "datasets", "nih")
 SPLITS_DIR = os.path.join(ROOT, "training", "splits")
 
-# Classes declared unavailable for this data mix (never trained, never reported).
-UNAVAILABLE = ["Atelectasis", "Pleural Effusion", "Edema", "Cardiomegaly",
-               "Lung Opacity", "Pneumothorax"]
+# NIH ChestX-ray14 label mapping (the CSV uses short names separated by '|'):
+#   Cardiomegaly, Effusion, Infiltration, Mass, Nodule, Atelectasis,
+#   Pneumothorax, Consolidation, Edema, Emphysema, Fibrosis, Pleural_Thickening,
+#   Pneumonia, Hernia
+# Map to our 10-class schema:
+nih_LABEL_MAP = {
+    "Cardiomegaly": "Cardiomegaly",
+    "Effusion": "Pleural Effusion",
+    "Infiltration": "Lung Opacity",
+    "Consolidation": "Lung Opacity",
+    "Mass": "Lung Opacity",
+    "Nodule": "Lung Opacity",
+    "Atelectasis": "Atelectasis",
+    "Pneumothorax": "Pneumothorax",
+    "Edema": "Edema",
+    "Pneumonia": "Pneumonia",
+    # Not in our 10-class schema: Emphysema, Fibrosis, Pleural_Thickening, Hernia
+}
+
+# Classes declared unavailable only when NIH data is absent.
+# When NIH ChestX-ray14 IS available, all 10 classes can be trained.
+UNAVAILABLE_WITHOUT_NIH = ["Atelectasis", "Pleural Effusion", "Edema",
+                           "Cardiomegaly", "Lung Opacity", "Pneumothorax"]
 
 
 def ingest_shenzhen():
@@ -138,6 +159,60 @@ def ingest_covid():
     return records
 
 
+def ingest_nih():
+    """Return records from NIH ChestX-ray14 dataset.
+
+    Expected layout under datasets/nih/:
+      images/           — PNG files named like 00000001_000.png
+      DataEntry_2017.csv — multi-label annotations
+
+    Download from: https://nihcc.app.box.com/v/ChestXray-NIHCC
+    Or Kaggle:     https://www.kaggle.com/datasets/nih-chest-xrays/data
+    """
+    records = []
+    csv_path = os.path.join(NIH_DIR, "DataEntry_2017.csv")
+    img_dir = os.path.join(NIH_DIR, "images")
+    if not (os.path.exists(csv_path) and os.path.isdir(img_dir)):
+        print(f"[nih] DataEntry_2017.csv or images dir missing: {NIH_DIR}")
+        return records
+    excluded = 0
+    seen_patients = set()  # for per-patient dedup tracking
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fname = (row.get("Image Index") or "").strip()
+            if not fname:
+                continue
+            finding_raw = (row.get("Finding Labels") or "").strip()
+            pid = (row.get("Patient ID") or "").strip()
+            if not finding_raw or finding_raw == "No Finding":
+                labels = ["No Finding"]
+            else:
+                nih_labels = [l.strip() for l in finding_raw.split("|") if l.strip()]
+                mapped = set()
+                for nl in nih_labels:
+                    if nl in nih_LABEL_MAP:
+                        mapped.add(nih_LABEL_MAP[nl])
+                if not mapped:
+                    excluded += 1
+                    continue
+                labels = sorted(mapped)
+            img_path = os.path.join(img_dir, fname)
+            if not os.path.exists(img_path):
+                excluded += 1
+                continue
+            records.append({
+                "image_path": os.path.relpath(img_path, ROOT),
+                "labels": labels,
+                "patient_id": "nih_" + str(pid),
+                "dataset_source": "nih",
+            })
+    if excluded:
+        print(f"[nih] excluded {excluded} rows (unmapped labels or missing files)")
+    print(f"[nih] loaded {len(records)} records from NIH ChestX-ray14")
+    return records
+
+
 def patient_split(records, train_frac=0.7, val_frac=0.15, seed=42):
     """Patient-level split; every image of a patient stays in one partition."""
     patients = sorted({r["patient_id"] for r in records})
@@ -169,11 +244,16 @@ def main():
     args = parser.parse_args()
     t_frac, v_frac, _ = args.split
 
-    records = ingest_shenzhen() + ingest_covid()
+    records = ingest_shenzhen() + ingest_covid() + ingest_nih()
     if not records:
         print("\n[ingest] No usable records — datasets/ is empty or missing.\n"
               "         Download the sources per docs/dataset-research.md first.")
         sys.exit(1)
+
+    # Determine which sources are available
+    sources_present = set(r["dataset_source"] for r in records)
+    has_nih = "nih" in sources_present
+    UNAVAILABLE = [] if has_nih else UNAVAILABLE_WITHOUT_NIH
 
     train_r, val_r, test_r = patient_split(records, t_frac, v_frac, args.seed)
 
@@ -187,16 +267,20 @@ def main():
     pos_all = count_positives(records, DEFAULT_LABELS)
     trained = [l for l in DEFAULT_LABELS if pos_all[l] > 0 and l not in UNAVAILABLE]
     untrained = [l for l in DEFAULT_LABELS if l not in trained]
+    all_sources = sorted(sources_present)
     print(f"[data] records: {len(records)}  patients: {len({r['patient_id'] for r in records})}")
-    print(f"[data] per-source: { {s: sum(1 for r in records if r['dataset_source'] == s) for s in ('shenzhen', 'covid19')} }")
+    print(f"[data] sources: {all_sources}")
     print(f"[data] positives: {pos_all}")
     print(f"[labels] TRAINED: {trained}")
-    print(f"[labels] UNAVAILABLE (no legitimate data / declared): {untrained}")
+    if untrained:
+        print(f"[labels] UNAVAILABLE (no legitimate data / declared): {untrained}")
+    else:
+        print(f"[labels] All 10 classes have training data — full model capability.")
 
     for name, part in (("train", train_r), ("val", val_r), ("test", test_r)):
         write_split_csv(part, os.path.join(args.splits_dir, f"{name}.csv"))
         n_pat = len({r["patient_id"] for r in part})
-        n_src = {s: sum(1 for r in part if r["dataset_source"] == s) for s in ("shenzhen", "covid19")}
+        n_src = {s: sum(1 for r in part if r["dataset_source"] == s) for s in all_sources}
         print(f"[split] {name:<5} images={len(part):>4} patients={n_pat:>4} sources={n_src}")
 
     report = {
@@ -205,7 +289,7 @@ def main():
         "split_fractions": list(args.split),
         "total_images": len(records),
         "total_patients": len({r["patient_id"] for r in records}),
-        "per_source": {s: sum(1 for r in records if r["dataset_source"] == s) for s in ("shenzhen", "covid19")},
+        "per_source": {s: sum(1 for r in records if r["dataset_source"] == s) for s in all_sources},
         "trained_classes": trained,
         "unavailable_classes": untrained,
         "class_positives": pos_all,
@@ -215,7 +299,7 @@ def main():
                 "images": len(part),
                 "patients": len({r["patient_id"] for r in part}),
                 "positives": count_positives(part, DEFAULT_LABELS),
-                "sources": {s: sum(1 for r in part if r["dataset_source"] == s) for s in ("shenzhen", "covid19")},
+                "sources": {s: sum(1 for r in part if r["dataset_source"] == s) for s in all_sources},
             }
             for name, part in (("train", train_r), ("val", val_r), ("test", test_r))
         },

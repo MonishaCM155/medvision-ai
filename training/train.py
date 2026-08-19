@@ -302,11 +302,22 @@ def main():
     print(f"[data] records: train={len(train_records)} val={len(val_records)}")
     print(f"[data] positives: {count_positives(records, label_names)}")
 
-    unavailable = list(ds.get("unavailable_classes") or [])
+    # Dynamically determine unavailable classes based on actual positive
+    # counts in the training data, not just the hardcoded config. This allows
+    # new datasets (e.g. NIH ChestX-ray14) to enable previously unavailable
+    # classes like Cardiomegaly.
+    pos_counts = count_positives(records, label_names)
+    config_unavailable = list(ds.get("unavailable_classes") or [])
+    # A class is unavailable if it has zero positives across ALL data
+    data_unavailable = [lab for lab in label_names if pos_counts.get(lab, 0) == 0]
+    # Union: config-declared unavailable OR data-confirmed zero-positive
+    unavailable = sorted(set(config_unavailable) | set(data_unavailable))
     trained_classes, untrained_classes = available_classes(records, label_names, unavailable)
     print(f"[labels] trained: {', '.join(trained_classes)}")
     if untrained_classes:
         print(f"[labels] unavailable (no training signal — kept at 0, never reported as findings): {', '.join(untrained_classes)}")
+    else:
+        print(f"[labels] All classes have training data — full model capability.")
 
     batch_size = int(args.batch_size if args.batch_size else tr.get("batch_size", 32))
     input_size = int(ds.get("input_size", 224))
@@ -382,13 +393,25 @@ def main():
     else:
         results_dir = str(tr.get("results_dir") or "training/results")
     os.makedirs(results_dir, exist_ok=True)
+    # Determine the actual dataset description: multi-source splits take priority.
+    if train_records and os.path.exists(os.path.join(splits_dir, "ingest_report.json")):
+        try:
+            with open(os.path.join(splits_dir, "ingest_report.json")) as _f:
+                _ir = json.load(_f)
+            ds_desc = _ir.get("sources", "multi-source")
+            if isinstance(ds_desc, list):
+                ds_desc = ", ".join(str(s) for s in ds_desc)
+        except Exception:
+            ds_desc = "multi-source (Cohen + Shenzhen)"
+    else:
+        ds_desc = str(labels_csv)
     ckpt_meta = {
         "label_names": list(label_names),
         "label_alias": label_alias,
         "unavailable_classes": list(untrained_classes),
         "trained_classes": list(trained_classes),
-        "dataset": {"labels_csv": str(labels_csv), "images_dir": str(images_dir),
-                    "splits_dir": str(splits_dir)},
+        "dataset": {"description": ds_desc, "labels_csv": str(labels_csv),
+                    "images_dir": str(images_dir), "splits_dir": str(splits_dir)},
         "threshold_policy": str(tr.get("threshold_policy", "validate-max-f1")),
         "seed": seed,
     }
