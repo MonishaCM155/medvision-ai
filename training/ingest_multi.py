@@ -172,9 +172,34 @@ def ingest_nih():
     records = []
     csv_path = os.path.join(NIH_DIR, "DataEntry_2017.csv")
     img_dir = os.path.join(NIH_DIR, "images")
-    if not (os.path.exists(csv_path) and os.path.isdir(img_dir)):
-        print(f"[nih] DataEntry_2017.csv or images dir missing: {NIH_DIR}")
+
+    # Allow external image directory via IMAGES_DIR.txt (for datasets stored
+    # outside the repo, e.g. downloaded NIH crops).
+    dir_marker = os.path.join(NIH_DIR, "IMAGES_DIR.txt")
+    if not os.path.isdir(img_dir) and os.path.exists(dir_marker):
+        with open(dir_marker, encoding="utf-8") as _f:
+            alt = _f.read().strip()
+        if alt and os.path.isdir(alt):
+            img_dir = alt
+            print(f"[nih] using external image dir from IMAGES_DIR.txt: {alt}")
+
+    if not os.path.exists(csv_path):
+        print(f"[nih] DataEntry_2017.csv missing: {csv_path}")
+        print(f"      Download from: https://nihcc.app.box.com/v/ChestXray-NIHCC")
+        print(f"      Or Kaggle:     https://www.kaggle.com/datasets/nih-chest-xrays/data")
+        print(f"      Place it at:   datasets/nih/DataEntry_2017.csv")
         return records
+    if not os.path.isdir(img_dir):
+        print(f"[nih] images dir missing: {img_dir}")
+        return records
+
+    # Build a filename→path index that searches subdirectories (images_003/, etc.)
+    img_index = {}  # fname -> full path
+    if os.path.isdir(img_dir):
+        for root, _dirs, fnames in os.walk(img_dir):
+            for fn in fnames:
+                if fn.lower().endswith(".png"):
+                    img_index[fn] = os.path.join(root, fn)
     excluded = 0
     seen_patients = set()  # for per-patient dedup tracking
     with open(csv_path, newline="", encoding="utf-8") as f:
@@ -197,7 +222,7 @@ def ingest_nih():
                     excluded += 1
                     continue
                 labels = sorted(mapped)
-            img_path = os.path.join(img_dir, fname)
+            img_path = img_index.get(fname) or os.path.join(img_dir, fname)
             if not os.path.exists(img_path):
                 excluded += 1
                 continue
